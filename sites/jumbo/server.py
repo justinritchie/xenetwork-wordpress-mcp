@@ -217,6 +217,33 @@ mcp = FastMCP(name=SERVER_NAME, lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
+# Cross-site disambiguation: prepend a "[WP site: <label>]" tag to every
+# tool's description so MCP clients can pick the right wordpress-* connector
+# by semantic search. This server itself hosts MANY Jumbo client sites
+# (opusadvisors, lcatt, jumbo.live, etc.) — internal switching happens via
+# the switch_site tool. The label here only disambiguates the wordpress-jumbo
+# MCP from wordpress-xenetwork and wordpress-energytransitionshow.
+#
+# Override via WP_SITE_LABEL env var; default is "Jumbo client sites".
+# ---------------------------------------------------------------------------
+SITE_LABEL = os.environ.get("WP_SITE_LABEL", "Jumbo client sites (opusadvisors, lcatt, jumbo.live, etc.)")
+
+if SITE_LABEL:
+    _label_prefix = f"[WP site: {SITE_LABEL}] "
+    _original_mcp_tool = mcp.tool
+
+    def _site_labeled_tool(*args, **kwargs):
+        """Wrap mcp.tool so every registered tool gets `[WP site: …]`
+        prepended to its description. Forwards everything else unchanged."""
+        desc = kwargs.get("description")
+        if desc and not desc.startswith(_label_prefix):
+            kwargs["description"] = _label_prefix + desc
+        return _original_mcp_tool(*args, **kwargs)
+
+    mcp.tool = _site_labeled_tool  # type: ignore[method-assign]
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -464,6 +491,268 @@ async def list_users(
 # ---------------------------------------------------------------------------
 # Boot
 # ---------------------------------------------------------------------------
+
+# >>> css-options-tools (managed by claude) >>>
+# =============================================================================
+# v2.5.0 mu-plugin readers — Customizer CSS + wp_options
+# =============================================================================
+#
+# Wraps /jumbo-qa/v1/{custom-css/*, options, options/<key>, options-search}
+# from jumbo-qa-rest.php v2.5.0+. All read-only. All gated on manage_options.
+#
+# Design:
+#   - get_custom_css_outline()  — orientation, ~2KB regardless of file size
+#   - search_custom_css(...)    — the workhorse: find rules that might conflict
+#   - get_custom_css_full()     — escape hatch when targeted tools miss it
+#   - list_options(prefix)      — paginated key+length summary
+#   - get_option(key)           — single full option
+#   - search_options(pattern)   — grep across option_name + option_value
+
+
+def _jq_url(path: str) -> str:
+    """Build absolute URL for a /wp-json/jumbo-qa/v1/{path} endpoint."""
+    site = _active()
+    return f"{site.url}/wp-json/jumbo-qa/v1{path}"
+
+
+async def _jq_request(method: str, path: str, params: dict | None = None) -> httpx.Response:
+    """HTTP request against active site's jumbo-qa/v1 endpoint."""
+    url = _jq_url(path)
+    kwargs: dict[str, Any] = {"headers": _site_headers()}
+    if params is not None:
+        kwargs["params"] = params
+    return await client.request(method, url, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Customizer "Additional CSS" readers
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    description=(
+        "Read the FULL Customizer 'Additional CSS' body for the active theme "
+        "on the currently-active Jumbo site. The escape hatch when targeted "
+        "tools (search/outline) don't catch what you need.\n"
+        "\n"
+        "Recommended pattern: call this, then immediately write the response's "
+        "`css` field to a local file in your workspace, then grep locally with "
+        "shell tools — this keeps the large blob out of your context window for "
+        "subsequent calls.\n"
+        "\n"
+        "Returns: {active_theme, css, length, line_count, hash, fetched_at, _meta}. "
+        "For a 10K-line CSS file expect a ~500KB-1MB response."
+    ),
+)
+async def get_custom_css_full() -> dict | str:
+    try:
+        r = await _jq_request("GET", "/custom-css/full")
+        r.raise_for_status()
+    except Exception as e:
+        return _err("get_custom_css_full", e)
+    data = r.json()
+    data["_meta"] = _meta(_active())
+    return data
+
+
+@mcp.tool(
+    description=(
+        "Read the STRUCTURE of the active theme's Customizer 'Additional CSS' "
+        "without the body. Returns the parsed section-comment markers (any "
+        "`/* === Section === */` or `/* --- Section --- */` style header), "
+        "total length, line count, SHA-1 hash, and a 10-line preview.\n"
+        "\n"
+        "Always ~2KB response regardless of CSS size — call this first to orient "
+        "before drilling in with search_custom_css or fetching the full blob.\n"
+        "\n"
+        "Returns: {active_theme, length, line_count, hash, sections: [{line, "
+        "title, raw}], preview: [first 10 lines], _meta}."
+    ),
+)
+async def get_custom_css_outline() -> dict | str:
+    try:
+        r = await _jq_request("GET", "/custom-css/outline")
+        r.raise_for_status()
+    except Exception as e:
+        return _err("get_custom_css_outline", e)
+    data = r.json()
+    data["_meta"] = _meta(_active())
+    return data
+
+
+@mcp.tool(
+    description=(
+        "Regex or literal-substring search across the active theme's Customizer "
+        "CSS. The workhorse for 'find any existing rules that might conflict "
+        "with what I'm about to add.'\n"
+        "\n"
+        "Args:\n"
+        "  pattern: required. Literal string by default; pass regex=True to "
+        "interpret as PCRE regex.\n"
+        "  context_lines: 0-20 (default 5). Lines of surrounding context per match.\n"
+        "  max_matches: 1-500 (default 50). Hard cap on matches returned.\n"
+        "  case_insensitive: default False.\n"
+        "  regex: default True. If False, pattern is taken literally.\n"
+        "\n"
+        "Returns: {pattern, regex, case_insensitive, context_lines, "
+        "total_match_count, returned_count, truncated, matches: "
+        "[{line_number, line, context_before, context_after}], _meta}.\n"
+        "\n"
+        "Examples:\n"
+        "  search_custom_css('!important')\n"
+        "  search_custom_css('@media.*max-width.*768', regex=True)\n"
+        "  search_custom_css('.gform_wrapper', regex=False)\n"
+        "  search_custom_css('#003366|#003c66', regex=True, case_insensitive=True)"
+    ),
+)
+async def search_custom_css(
+    pattern: str,
+    context_lines: int = 5,
+    max_matches: int = 50,
+    case_insensitive: bool = False,
+    regex: bool = True,
+) -> dict | str:
+    params = {
+        "pattern": pattern,
+        "context": context_lines,
+        "max_matches": max_matches,
+        "case_insensitive": "true" if case_insensitive else "false",
+        "regex": "true" if regex else "false",
+    }
+    try:
+        r = await _jq_request("GET", "/custom-css/search", params=params)
+        r.raise_for_status()
+    except Exception as e:
+        return _err("search_custom_css", e)
+    data = r.json()
+    data["_meta"] = _meta(_active())
+    return data
+
+
+# ---------------------------------------------------------------------------
+# wp_options readers
+# ---------------------------------------------------------------------------
+
+@mcp.tool(
+    description=(
+        "Get a single wp_options value from the currently-active Jumbo site. "
+        "WordPress auto-unserializes arrays/objects so callers see the "
+        "structured form. Use this for things like:\n"
+        "  - 'blogname' / 'blogdescription' / 'siteurl'\n"
+        "  - 'theme_mods_<active-theme-slug>' (Customizer settings array)\n"
+        "  - 'gforms_settings' / 'rg_form_field_settings'\n"
+        "  - any plugin's settings option\n"
+        "\n"
+        "Args:\n"
+        "  key: required. The exact option_name from wp_options.\n"
+        "  max_chars: default 100000. Caps the JSON-encoded value size; "
+        "truncated:true flag is set if exceeded.\n"
+        "\n"
+        "Returns: {key, value, type, length, truncated, max_chars, autoload, _meta}.\n"
+        "404 if the option doesn't exist (disambiguated from 'value is false')."
+    ),
+)
+async def get_option(key: str, max_chars: int = 100000) -> dict | str:
+    try:
+        r = await _jq_request("GET", f"/options/{key}", params={"max_chars": max_chars})
+        if r.status_code == 404:
+            return _err("get_option", ValueError(f"option '{key}' does not exist"))
+        r.raise_for_status()
+    except Exception as e:
+        return _err("get_option", e)
+    data = r.json()
+    data["_meta"] = _meta(_active())
+    return data
+
+
+@mcp.tool(
+    description=(
+        "List wp_options matching a REQUIRED prefix. Prefix is required to "
+        "prevent accidental full-table dump (wp_options can have 1000+ rows on "
+        "a plugin-heavy site).\n"
+        "\n"
+        "Args:\n"
+        "  prefix: required. option_name prefix (e.g. 'theme_mods_', "
+        "'gforms_', 'widget_', 'cron').\n"
+        "  autoload: optional 'yes' | 'no' filter.\n"
+        "  max_value_chars: default 200. Values longer than this are truncated; "
+        "use get_option() to fetch the full value if interesting.\n"
+        "  limit: 1-500 (default 100).\n"
+        "\n"
+        "Returns: {prefix, autoload_filter, count, items: [{key, value, length, "
+        "truncated, autoload, hash}], _meta}.\n"
+        "\n"
+        "Common prefixes worth knowing:\n"
+        "  theme_mods_<slug>  — Customizer theme settings\n"
+        "  gforms_            — Gravity Forms settings\n"
+        "  widget_            — widget settings per widget area\n"
+        "  jetpack_           — Jetpack module configs\n"
+        "  cron               — wp-cron schedule"
+    ),
+)
+async def list_options(
+    prefix: str,
+    autoload: str | None = None,
+    max_value_chars: int = 200,
+    limit: int = 100,
+) -> dict | str:
+    params: dict[str, Any] = {
+        "prefix": prefix,
+        "max_value_chars": max_value_chars,
+        "limit": limit,
+    }
+    if autoload is not None:
+        params["autoload"] = autoload
+    try:
+        r = await _jq_request("GET", "/options", params=params)
+        r.raise_for_status()
+    except Exception as e:
+        return _err("list_options", e)
+    data = r.json()
+    data["_meta"] = _meta(_active())
+    return data
+
+
+@mcp.tool(
+    description=(
+        "Substring search across wp_options names AND values. Returns context "
+        "snippets so callers can see what matched without fetching whole "
+        "values. Useful for 'which option contains this URL/email/token?'.\n"
+        "\n"
+        "Args:\n"
+        "  pattern: required. Plain substring (LIKE-style match — no regex).\n"
+        "  prefix: optional option_name prefix to scope the search.\n"
+        "  limit: 1-500 (default 100).\n"
+        "  context_chars: 0-2000 (default 100). Surrounding chars around match.\n"
+        "\n"
+        "Returns: {pattern, prefix_filter, count, matches: [{key, autoload, "
+        "value_length, match_in_name, match_in_value, context}], _meta}.\n"
+        "\n"
+        "Note: this is a SQL LIKE search, not regex. For regex, fetch via "
+        "get_option(key) or list_options(prefix) and grep locally."
+    ),
+)
+async def search_options(
+    pattern: str,
+    prefix: str | None = None,
+    limit: int = 100,
+    context_chars: int = 100,
+) -> dict | str:
+    params: dict[str, Any] = {
+        "pattern": pattern,
+        "limit": limit,
+        "context_chars": context_chars,
+    }
+    if prefix is not None:
+        params["prefix"] = prefix
+    try:
+        r = await _jq_request("GET", "/options-search", params=params)
+        r.raise_for_status()
+    except Exception as e:
+        return _err("search_options", e)
+    data = r.json()
+    data["_meta"] = _meta(_active())
+    return data
+# <<< css-options-tools (managed by claude) <<<
 
 if __name__ == "__main__":
     print(

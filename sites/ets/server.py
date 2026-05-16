@@ -105,6 +105,40 @@ mcp = FastMCP(name=SERVER_NAME, lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
+# Cross-site disambiguation: prepend a "[WP site: <label>]" tag to every
+# tool's description so MCP clients (and the LLMs driving them) can pick the
+# right wordpress-* connector by semantic search. Otherwise tools like
+# get_form / list_users / get_episode look identical across wordpress-jumbo,
+# wordpress-xenetwork, and wordpress-energytransitionshow.
+#
+# WP_SITE_LABEL overrides the auto-derivation. Default derives from SERVER_NAME.
+# ---------------------------------------------------------------------------
+_SITE_LABELS = {
+    "wordpress-xenetwork": "xenetwork.org (network root)",
+    "wordpress-jumbo": "Jumbo client sites",
+    "wordpress-energytransitionshow": "energytransitionshow.com (ETS subsite)",
+    "wordpress-ets": "energytransitionshow.com (ETS subsite)",
+}
+SITE_LABEL = os.environ.get("WP_SITE_LABEL", "") or _SITE_LABELS.get(
+    SERVER_NAME, SERVER_NAME
+)
+
+if SITE_LABEL:
+    _label_prefix = f"[WP site: {SITE_LABEL}] "
+    _original_mcp_tool = mcp.tool
+
+    def _site_labeled_tool(*args, **kwargs):
+        """Wrap mcp.tool so every registered tool gets `[WP site: …]`
+        prepended to its description. Forwards everything else unchanged."""
+        desc = kwargs.get("description")
+        if desc and not desc.startswith(_label_prefix):
+            kwargs["description"] = _label_prefix + desc
+        return _original_mcp_tool(*args, **kwargs)
+
+    mcp.tool = _site_labeled_tool  # type: ignore[method-assign]
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

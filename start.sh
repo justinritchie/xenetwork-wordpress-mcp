@@ -39,10 +39,26 @@ fi
 # shellcheck disable=SC1090
 set -a; source "$ENV_FILE"; set +a
 
-: "${WP_BASE_URL:?must be set in $ENV_FILE}"
-: "${WP_USERNAME:?must be set in $ENV_FILE}"
-: "${WP_APP_PASSWORD:?must be set in $ENV_FILE}"
-: "${WP_MCP_PORT:?must be set in $ENV_FILE}"
+# Detect multi-site mode by checking for any WP_SITE_*_URL vars (after env load).
+# Multi-site env files use the WP_SITE_<NAME>_* triple pattern + WP_DEFAULT_SITE.
+# Single-site env files (wordpress-energytransitionshow, wordpress-xenetwork)
+# use WP_BASE_URL/WP_USERNAME/WP_APP_PASSWORD directly.
+MULTI_SITE_MODE=0
+if compgen -v 2>/dev/null | grep -qE '^WP_SITE_[A-Z0-9_]+_URL$'; then
+  MULTI_SITE_MODE=1
+fi
+
+if [[ "$MULTI_SITE_MODE" -eq 1 ]]; then
+  # Multi-site: server.py validates WP_SITE_<NAME>_* triples itself.
+  # Only require WP_MCP_PORT here; the rest is server.py's concern.
+  : "${WP_MCP_PORT:?must be set in $ENV_FILE}"
+else
+  # Single-site: keep the original strict validation.
+  : "${WP_BASE_URL:?must be set in $ENV_FILE}"
+  : "${WP_USERNAME:?must be set in $ENV_FILE}"
+  : "${WP_APP_PASSWORD:?must be set in $ENV_FILE}"
+  : "${WP_MCP_PORT:?must be set in $ENV_FILE}"
+fi
 export WP_MCP_SERVER_NAME="${WP_MCP_SERVER_NAME:-wordpress-${SITE}}"
 
 # Refuse to start if port is already bound.
@@ -55,8 +71,13 @@ if lsof -i ":$WP_MCP_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
 fi
 
 echo "Starting wordpress-${SITE} MCP (FastMCP/streamable-http) on http://localhost:${WP_MCP_PORT}/mcp"
-echo "WP base URL: $WP_BASE_URL"
-echo "WP user:     $WP_USERNAME"
+if [[ "$MULTI_SITE_MODE" -eq 1 ]]; then
+  echo "Mode:        multi-site (WP_SITE_<NAME>_* triples)"
+  echo "Default:     ${WP_DEFAULT_SITE:-<unset>}"
+else
+  echo "WP base URL: $WP_BASE_URL"
+  echo "WP user:     $WP_USERNAME"
+fi
 echo
 
 # uv run --script handles dep install + venv on first execution.

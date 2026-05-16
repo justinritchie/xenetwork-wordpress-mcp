@@ -104,6 +104,43 @@ mcp = FastMCP(name=SERVER_NAME, lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
+# Cross-site disambiguation: prepend a "[WP site: <label>]" tag to every
+# tool's description so MCP clients (and the LLMs driving them) can pick the
+# right wordpress-* connector by semantic search. When Justin has all three
+# WP sites wired up (xenetwork.org root, jumbo.live root, energytransitionshow
+# subsite), tools like get_form / list_users / find_user_by_email otherwise
+# look identical across instances.
+#
+# WP_SITE_LABEL overrides the auto-derivation. Defaults derive from SERVER_NAME
+# via a small slug table (wordpress-xenetwork → "xenetwork.org network root",
+# wordpress-jumbo → "jumbo.live network root", etc.).
+# ---------------------------------------------------------------------------
+_SITE_LABELS = {
+    "wordpress-xenetwork": "xenetwork.org (network root)",
+    "wordpress-jumbo": "jumbo.live (network root)",
+    "wordpress-energytransitionshow": "energytransitionshow.com (subsite)",
+}
+SITE_LABEL = os.environ.get("WP_SITE_LABEL", "") or _SITE_LABELS.get(
+    SERVER_NAME, SERVER_NAME
+)
+
+if SITE_LABEL:
+    _label_prefix = f"[WP site: {SITE_LABEL}] "
+    _original_mcp_tool = mcp.tool
+
+    def _site_labeled_tool(*args, **kwargs):
+        """Wrap mcp.tool so every registered tool gets `[WP site: …]`
+        prepended to its description. Critical for multi-WP semantic search.
+        Forwards everything else through unchanged."""
+        desc = kwargs.get("description")
+        if desc and not desc.startswith(_label_prefix):
+            kwargs["description"] = _label_prefix + desc
+        return _original_mcp_tool(*args, **kwargs)
+
+    mcp.tool = _site_labeled_tool  # type: ignore[method-assign]
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -634,6 +671,143 @@ async def get_form_entry(id: str) -> dict | str:
         r.raise_for_status()
     except Exception as e:
         return _err("get_form_entry", e)
+    return r.json()
+
+# count-users-by-role tool (managed by xen_count_users_patch)
+@mcp.tool(
+    description=(
+        "Single-call rollup of WordPress user counts grouped by role on "
+        "xenetwork.org (Energy Transition Show / XE Network). Returns counts "
+        "for EVERY role on the site — both stock WordPress roles "
+        "(administrator, editor, subscriber) AND s2Member membership levels "
+        "(s2member_level0 through s2member_level5).\n"
+        "\n"
+        "USE WHENEVER the user asks any of:\n"
+        "  - 'how many users at each level' / 'membership level rollup' / "
+        "'level distribution'\n"
+        "  - 'count users by role' / 'role distribution' / 'WP role counts'\n"
+        "  - 'how many subscribers' / 'how many level 1' / 'level 2 / 3 / 4 / 5'\n"
+        "  - 'monthly user count' / 'month-end user numbers' / 'who's at what tier'\n"
+        "  - 'paid tier breakdown' / 'membership tiers' / 'how big is the membership'\n"
+        "  - 'total active members' / 'XE Network user roster size'\n"
+        "  - any monthly-close, bookkeeping, or board-report question about "
+        "user counts on the XE Network main site\n"
+        "\n"
+        "PREFER THIS over list_users + manual counting — list_users requires "
+        "paginating through 10,000+ user records (5+ minutes of LLM context "
+        "burn); this returns the entire rollup in ONE HTTP call (~200 bytes) "
+        "by hitting the custom /xen/v1/users/count-by-role endpoint that "
+        "wraps WordPress's native count_users() SQL function (single GROUP BY "
+        "query at the database).\n"
+        "\n"
+        "DO NOT use for filtering by Custom Capability (CCAP) like 'qcf' or "
+        "'sabu' — those don't appear as roles. Use count_users_by_ccap "
+        "instead for any CCAP / capability / s2Member-ccap question.\n"
+        "\n"
+        "Returns:\n"
+        "  {\n"
+        "    total_users: int,\n"
+        "    avail_roles: {role_slug: count, ...},  # every role with users\n"
+        "    sorted_desc: same map sorted by count descending,\n"
+        "    site, generated_at\n"
+        "  }\n"
+        "\n"
+        "Requires list_users capability on xenetwork.org (admin/editor)."
+    ),
+)
+async def count_users_by_role() -> dict | str:
+    try:
+        r = await client.get(f"{WP_BASE}/wp-json/xen/v1/users/count-by-role")
+        r.raise_for_status()
+    except Exception as e:
+        return _err("count_users_by_role", e)
+    return r.json()
+
+# count-users-by-ccap tool (managed by xen_count_users_patch v2)
+@mcp.tool(
+    description=(
+        "Count xenetwork.org users by s2Member Custom Capability (CCAP) with "
+        "substring/pattern matching. Server-side aggregation via the "
+        "/xen/v1/users/by-ccap endpoint — returns just counts (and optional "
+        "user list for spot-checking), NOT full user records.\n"
+        "\n"
+        "WHAT IS A CCAP: Custom Capability. s2Member uses these for "
+        "fine-grained access alongside membership levels. They live in the "
+        "user's wp_capabilities blob as keys like 'access_s2member_ccap_<slug>'. "
+        "The CCAP slug is the part AFTER 'access_s2member_ccap_'. Examples: "
+        "'sunqcf', 'sabuqcf', 'kmutqcf', 'witsqcf', 'premium_yearly', "
+        "'inspireqcf', 'unopsqcf', 'elaqcf', 'cvfqcf'.\n"
+        "\n"
+        "USE WHENEVER the user asks any of:\n"
+        "  - 'how many users have CCAP X' / 'count users with capability X'\n"
+        "  - 'how many people have a CCAP ending with qcf' (QCF Global South "
+        "Grant program tracking)\n"
+        "  - 'show me everyone with the sabu / kmut / wits / sun / inspire / "
+        "unops / ela / cvf capability'\n"
+        "  - 'who has a premium-* CCAP' / 'count premium ccap users'\n"
+        "  - 'rollup of QCF participants' / 'QCF cohort sizes' / "
+        "'how many QCF licenses are active'\n"
+        "  - 'filter users by capability' / 'users by access_s2member_ccap_*'\n"
+        "  - any question matching 'how many users have' + a capability/CCAP/"
+        "access pattern\n"
+        "\n"
+        "MATCH MODES:\n"
+        "  pattern='qcf', match='ends_with'      → CCAPs ending in qcf "
+        "(sunqcf, sabuqcf, etc.)\n"
+        "  pattern='premium', match='starts_with' → premium_yearly, premium_monthly\n"
+        "  pattern='sabu', match='contains'       → any CCAP with 'sabu' "
+        "anywhere in the slug\n"
+        "  pattern='sunqcf', match='exact'        → only the exact slug 'sunqcf'\n"
+        "\n"
+        "PREFER THIS over list_users + per-user inspection — list_users "
+        "returns ~50KB per user record (s2Member adds tons of fields); this "
+        "endpoint queries wp_usermeta directly with a SQL prefilter, "
+        "deserializes only matching capability blobs server-side, and "
+        "returns ~200 bytes total.\n"
+        "\n"
+        "DO NOT use for plain WP role counting (administrator, editor, "
+        "subscriber, s2member_level1, etc.) — those are ROLES, not CCAPs. "
+        "Use count_users_by_role for level/role rollups.\n"
+        "\n"
+        "Args:\n"
+        "  pattern: required substring of the CCAP slug to match\n"
+        "  match: 'contains' (default) | 'ends_with' | 'starts_with' | 'exact'\n"
+        "  include_users: default False. True returns the list of matching "
+        "users with id/email/display_name/matching_ccaps — useful for "
+        "spot-checking who's in a cohort, but slower.\n"
+        "  limit: max users to scan in the SQL prefilter (default 1000). "
+        "Bump if you expect >1000 matches.\n"
+        "\n"
+        "Returns:\n"
+        "  {\n"
+        "    pattern, match,\n"
+        "    total_matching_users: int  (distinct users that matched),\n"
+        "    ccap_breakdown: {ccap_slug: user_count, ...} sorted by count desc,\n"
+        "    users: [...] | null  (only when include_users=True),\n"
+        "    rows_scanned, limit_used, site, generated_at\n"
+        "  }"
+    ),
+)
+async def count_users_by_ccap(
+    pattern: str,
+    match: str = "contains",
+    include_users: bool = False,
+    limit: int = 1000,
+) -> dict | str:
+    params = {
+        "pattern": pattern,
+        "match": match,
+        "include_users": "true" if include_users else "false",
+        "limit": limit,
+    }
+    try:
+        r = await client.get(
+            f"{WP_BASE}/wp-json/xen/v1/users/by-ccap",
+            params=params,
+        )
+        r.raise_for_status()
+    except Exception as e:
+        return _err("count_users_by_ccap", e)
     return r.json()
 
 

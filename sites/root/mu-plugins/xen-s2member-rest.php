@@ -340,3 +340,191 @@ add_action('rest_api_init', function () {
         ],
     ]);
 });
+
+// ===========================================================================
+// Append to xen-s2member-rest.php (xenetwork.org mu-plugin)
+// ===========================================================================
+//
+// Adds GET /wp-json/xen/v1/users/count-by-role — returns a single dict of
+// {role_slug: count} using WordPress's native count_users() function.
+//
+// One HTTP call gives the full role rollup. No paging, no per-role queries.
+// Required: 'list_users' capability (admin/editor).
+//
+// Append this at the bottom of xen-s2member-rest.php, before any closing tag.
+
+add_action('rest_api_init', function () {
+    register_rest_route('xen/v1', '/users/count-by-role', [
+        'methods'             => 'GET',
+        'permission_callback' => function () {
+            return current_user_can('list_users');
+        },
+        'callback' => function () {
+            // count_users() returns:
+            //   {
+            //     'total_users' => int,
+            //     'avail_roles' => ['administrator' => N, 'editor' => N, ...],
+            //   }
+            // Per-role counts include s2Member-added roles
+            // (s2member_level0, s2member_level1, etc.) since s2Member registers
+            // them as proper WP roles.
+            $counts = count_users();
+            return [
+                'total_users' => (int) $counts['total_users'],
+                'avail_roles' => $counts['avail_roles'],
+                // Add a sorted-by-count convenience alongside the raw map
+                'sorted_desc' => (function ($roles) {
+                    arsort($roles);
+                    return $roles;
+                })($counts['avail_roles']),
+                'site' => home_url(),
+                'generated_at' => current_time('c'),
+            ];
+        },
+    ]);
+});
+
+// ===========================================================================
+// Append to xen-s2member-rest.php — count_users_by_ccap endpoint
+// ===========================================================================
+//
+// Adds GET /wp-json/xen/v1/users/by-ccap — filter users by their s2Member
+// Custom Capability (CCAP) using contains / ends_with / starts_with / exact
+// pattern matching.
+//
+// Why a separate endpoint from count-by-role: CCAPs live in the serialized
+// `wp_capabilities` usermeta blob, not as proper WP roles, so count_users()
+// doesn't see them. We have to query wp_usermeta directly + deserialize.
+//
+// CCAP key format in wp_capabilities (after deserialize):
+//   {
+//     'subscriber'                           => true,
+//     's2member_level1'                      => true,
+//     'access_s2member_ccap_sabuqcf'         => true,   ← CCAP slug = 'sabuqcf'
+//     'access_s2member_ccap_kmutqcf'         => true,   ← CCAP slug = 'kmutqcf'
+//   }
+// The CCAP slug is whatever follows 'access_s2member_ccap_' in the cap key.
+
+add_action('rest_api_init', function () {
+    register_rest_route('xen/v1', '/users/by-ccap', [
+        'methods'             => 'GET',
+        'permission_callback' => function () { return current_user_can('list_users'); },
+        'args' => [
+            'pattern' => [
+                'required'          => true,
+                'type'              => 'string',
+                'description'       => 'CCAP slug substring to match.',
+                'sanitize_callback' => 'sanitize_text_field',
+            ],
+            'match' => [
+                'default'           => 'contains',
+                'type'              => 'string',
+                'description'       => "Match type: 'contains' | 'ends_with' | 'starts_with' | 'exact' (default: contains).",
+                'sanitize_callback' => 'sanitize_text_field',
+            ],
+            'include_users' => [
+                'default'     => false,
+                'type'        => 'boolean',
+                'description' => 'If true, include the list of matching users (id, email, display_name, matching_ccaps) — slower but useful for spot-checking.',
+            ],
+            'limit' => [
+                'default'     => 1000,
+                'type'        => 'integer',
+                'description' => 'Max users to scan (default 1000). Increase if your site has more than 1000 capability rows.',
+            ],
+        ],
+        'callback' => function ($request) {
+            global $wpdb;
+            $pattern       = (string) $request->get_param('pattern');
+            $match         = (string) $request->get_param('match');
+            $include_users = filter_var($request->get_param('include_users'), FILTER_VALIDATE_BOOLEAN);
+            $limit         = max(1, min(100000, (int) $request->get_param('limit')));
+
+            $cap_prefix = 'access_s2member_ccap_';
+            // The capability meta key is prefixed with the WP table prefix
+            // (e.g. wp_capabilities). On multisite the per-blog prefix differs,
+            // but for a single-site install $wpdb->prefix is 'wp_' so the
+            // meta_key is 'wp_capabilities'.
+            $cap_meta_key = $wpdb->prefix . 'capabilities';
+
+            // Coarse SQL prefilter: any row whose meta_value text contains
+            // both the cap_prefix AND the pattern. This narrows from "all
+            // users" to "users likely to match"; we then PHP-deserialize each
+            // matched row and verify per the requested match type.
+            $sql_like = '%' . $wpdb->esc_like($cap_prefix) . '%' . $wpdb->esc_like($pattern) . '%';
+
+            $rows = $wpdb->get_results($wpdb->prepare(
+                "SELECT user_id, meta_value FROM {$wpdb->usermeta}
+                 WHERE meta_key = %s AND meta_value LIKE %s
+                 LIMIT %d",
+                $cap_meta_key, $sql_like, $limit
+            ));
+
+            $ccap_counts = [];      // [ccap_slug => user_count]
+            $matching_users = [];   // [{id, email, display_name, matching_ccaps}]
+            $matching_user_ids = [];
+
+            foreach ($rows as $row) {
+                $caps = maybe_unserialize($row->meta_value);
+                if (!is_array($caps)) continue;
+
+                $user_ccaps_matched = [];
+                foreach ($caps as $cap_key_inner => $granted) {
+                    if (!$granted) continue;
+                    if (strpos((string) $cap_key_inner, $cap_prefix) !== 0) continue;
+                    $ccap = substr((string) $cap_key_inner, strlen($cap_prefix));
+
+                    $matches = false;
+                    switch ($match) {
+                        case 'ends_with':
+                            $matches = (strlen($pattern) <= strlen($ccap)) &&
+                                       (substr($ccap, -strlen($pattern)) === $pattern);
+                            break;
+                        case 'starts_with':
+                            $matches = (strpos($ccap, $pattern) === 0);
+                            break;
+                        case 'exact':
+                            $matches = ($ccap === $pattern);
+                            break;
+                        case 'contains':
+                        default:
+                            $matches = (strpos($ccap, $pattern) !== false);
+                            break;
+                    }
+                    if ($matches) {
+                        $user_ccaps_matched[] = $ccap;
+                        $ccap_counts[$ccap] = ($ccap_counts[$ccap] ?? 0) + 1;
+                    }
+                }
+
+                if (!empty($user_ccaps_matched)) {
+                    $matching_user_ids[(int) $row->user_id] = true;
+                    if ($include_users) {
+                        $u = get_userdata((int) $row->user_id);
+                        $matching_users[] = [
+                            'id'             => (int) $row->user_id,
+                            'email'          => $u ? $u->user_email : null,
+                            'display_name'   => $u ? $u->display_name : null,
+                            'matching_ccaps' => $user_ccaps_matched,
+                        ];
+                    }
+                }
+            }
+
+            arsort($ccap_counts);
+
+            return [
+                'pattern'              => $pattern,
+                'match'                => $match,
+                'total_matching_users' => count($matching_user_ids),
+                'ccap_breakdown'       => (object) $ccap_counts,
+                'users'                => $include_users ? $matching_users : null,
+                'site'                 => home_url(),
+                'generated_at'         => current_time('c'),
+                'rows_scanned'         => count($rows),
+                'limit_used'           => $limit,
+            ];
+        },
+    ]);
+});
+
