@@ -32,13 +32,50 @@ Run with:
 from __future__ import annotations
 
 import base64
+import json
 import os
 import sys
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Annotated, Any, Dict, Optional
 
 import httpx
 from fastmcp import FastMCP
+from pydantic import BeforeValidator
+
+
+def _coerce_obj(v: Any) -> Any:
+    """Coerce a JSON-object-like value into a real dict.
+
+    Why this exists: some MCP clients serialize dict-typed tool params as a
+    JSON *string* when the param's JSON schema doesn't carry an explicit
+    `"type": "object"`. Pydantic then rejects the string with a `dict_type`
+    error ("Input should be a valid dictionary") BEFORE the tool body runs.
+    Running this as a Pydantic BeforeValidator intercepts that case: a JSON
+    string is parsed to a dict before the dict validation happens, so both a
+    proper object and a stringified object are accepted. Belt-and-suspenders
+    alongside the explicit object typing on the annotated params below.
+    """
+    if v is None or isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            parsed = json.loads(s)
+        except Exception as e:  # noqa: BLE001 — surface as a clean validation error
+            raise ValueError(f"expected a JSON object, got unparseable string: {e}")
+        if not isinstance(parsed, dict):
+            raise ValueError("expected a JSON object (a {key: value} mapping)")
+        return parsed
+    raise ValueError(f"expected an object/dict, got {type(v).__name__}")
+
+
+# An optional {str: value} object param that tolerates string-serialized JSON.
+# Using Annotated keeps an explicit object type in the generated schema (so
+# well-behaved clients send a real object) while the BeforeValidator catches
+# clients that send a JSON string anyway.
+ObjParam = Annotated[Optional[Dict[str, Any]], BeforeValidator(_coerce_obj)]
 
 
 WP_BASE = os.environ.get("WP_BASE_URL", "").rstrip("/")
@@ -444,14 +481,19 @@ async def duplicate_institutional(
     source_id: int,
     new_title: str,
     new_slug: str,
-    content_replacements: dict[str, str] | None = None,
-    meta_overrides: dict[str, Any] | None = None,
+    content_replacements: ObjParam = None,
+    meta_overrides: ObjParam = None,
     status: str = "draft",
 ) -> dict | str:
     """Hits the custom /xen/v1/institutional/duplicate endpoint, which
     copies content + all postmeta + all taxonomies server-side. The MCP
     just passes overrides through — heavy lifting is done in PHP where we
-    have direct DB access via update_post_meta()."""
+    have direct DB access via update_post_meta().
+
+    The PHP endpoint auto-clears the source's per-cohort fields on duplicate
+    (registered_member_list + form_entry_id) alongside the counter reset, so
+    a clone never inherits the prior institution's registrant emails.
+    """
     payload: dict[str, Any] = {
         "source_id": source_id,
         "new_title": new_title,
@@ -468,13 +510,26 @@ async def duplicate_institutional(
         r.raise_for_status()
     except Exception as e:
         return _err("duplicate_institutional", e)
-    return r.json()
+    result = r.json()
+    # QoL: surface the clean public URL the slug will resolve to once
+    # published (reviewers want this in addition to the ?p=ID&preview link).
+    # The PHP endpoint also returns this now; compute a fallback here so the
+    # field is present even before the mu-plugin redeploy.
+    if isinstance(result, dict) and not result.get("public_url"):
+        slug = result.get("new_slug") or new_slug
+        result["public_url"] = (
+            f"{WP_BASE}/become-a-member-ets/institutions/{slug}/"
+        )
+    return result
 
 
 @mcp.tool(
     description=(
         "Update an existing Institutional Registration page. Use to fix "
-        "typos in a draft (or correct a published page).\n"
+        "typos in a draft, correct a published page, or — via `meta` — set "
+        "institution-specific postmeta WITHOUT re-cloning (institution_name, "
+        "whitelisted_email, registration_limit, welcome_page, ToS text, "
+        "etc.).\n"
         "\n"
         "Args:\n"
         "  id: post ID to update.\n"
@@ -483,8 +538,15 @@ async def duplicate_institutional(
         "  content: optional new full content body (replaces existing).\n"
         "  status: optional new status ('draft', 'publish', 'pending', "
         "'private'). To explicitly publish a draft, pass status='publish'.\n"
+        "  meta: optional object of postmeta key→value pairs to write "
+        "directly (hits the mu-plugin's postmeta endpoint, which can write "
+        "keys the default wp/v2 REST hides). Example: "
+        "{'institution_name': 'University of Nairobi', 'whitelisted_email': "
+        "'uonbi.ac.ke', 'registration_limit': '50'}. Run get_institutional "
+        "first to see existing keys.\n"
         "\n"
-        "Only specified fields are changed; unspecified fields preserved."
+        "At least one of title/slug/content/status/meta is required. Only "
+        "specified fields are changed; unspecified fields preserved."
     ),
     annotations={
         "destructiveHint": True,
@@ -498,6 +560,7 @@ async def update_institutional(
     slug: str | None = None,
     content: str | None = None,
     status: str | None = None,
+    meta: ObjParam = None,
 ) -> dict | str:
     payload: dict[str, Any] = {}
     if title is not None:
@@ -511,25 +574,55 @@ async def update_institutional(
             return f"ERROR: invalid status {status!r}"
         payload["status"] = status
 
-    if not payload:
-        return "ERROR: nothing to update — at least one of title/slug/content/status required"
+    if not payload and not meta:
+        return (
+            "ERROR: nothing to update — at least one of "
+            "title/slug/content/status/meta required"
+        )
 
-    try:
-        r = await client.post(f"/xen_institutional/{id}", json=payload)
-        r.raise_for_status()
-    except Exception as e:
-        return _err("update_institutional", e)
-    updated = r.json()
-    return {
+    fields_updated: list[str] = []
+    result: dict[str, Any] = {
         "ok": True,
-        "id": updated.get("id"),
-        "slug": updated.get("slug"),
-        "status": updated.get("status"),
-        "title": (updated.get("title") or {}).get("rendered"),
-        "modified": updated.get("modified"),
+        "id": id,
         "edit_url": f"https://xenetwork.org/wp-admin/post.php?post={id}&action=edit",
-        "fields_updated": list(payload.keys()),
     }
+
+    # Core post fields go through the standard wp/v2 endpoint.
+    if payload:
+        try:
+            r = await client.post(f"/xen_institutional/{id}", json=payload)
+            r.raise_for_status()
+        except Exception as e:
+            return _err("update_institutional", e)
+        updated = r.json()
+        result.update({
+            "slug": updated.get("slug"),
+            "status": updated.get("status"),
+            "title": (updated.get("title") or {}).get("rendered"),
+            "modified": updated.get("modified"),
+        })
+        fields_updated.extend(payload.keys())
+
+    # Postmeta goes through the mu-plugin endpoint (writes keys wp/v2 hides).
+    if meta:
+        try:
+            mr = await client.post(
+                f"{WP_BASE}/wp-json/xen/v1/institutional/{id}/meta",
+                json={"meta": meta},
+            )
+            mr.raise_for_status()
+        except Exception as e:
+            return _err("update_institutional (meta)", e)
+        meta_result = mr.json()
+        applied = (
+            meta_result.get("meta_updated")
+            if isinstance(meta_result, dict) else None
+        ) or list(meta.keys())
+        result["meta_updated"] = applied
+        fields_updated.extend(f"meta.{k}" for k in applied)
+
+    result["fields_updated"] = fields_updated
+    return result
 
 
 # ---------------------------------------------------------------------------

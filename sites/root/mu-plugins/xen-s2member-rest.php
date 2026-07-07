@@ -114,9 +114,10 @@ add_action('rest_api_init', function () {
     // 3. Custom routes for xen_institutional post duplication
     // -----------------------------------------------------------------------
     //
-    // Two endpoints under /wp-json/xen/v1/:
+    // Endpoints under /wp-json/xen/v1/:
     //   GET  /institutional/<id>             — full post + ALL postmeta + tax
     //   POST /institutional/duplicate         — clone source post w/ overrides
+    //   POST /institutional/<id>/meta         — write postmeta on an existing post
     //
     // The default wp/v2/xen_institutional REST endpoints only return meta
     // keys that have been registered with show_in_rest=>true via
@@ -247,6 +248,19 @@ add_action('rest_api_init', function () {
                 update_post_meta($new_id, $ck, $cv);
             }
 
+            // Auto-clear per-cohort fields — these belong to the SOURCE
+            // institution's registrants and must NOT carry over to a fresh
+            // clone (otherwise the new portal inherits the prior cohort's
+            // email list, which is wrong data and a privacy/publish risk).
+            // Cleared to empty string; caller meta_overrides still win below.
+            $cohort_clears = [
+                'registered_member_list' => '',
+                'form_entry_id'          => '',
+            ];
+            foreach ($cohort_clears as $ck => $cv) {
+                update_post_meta($new_id, $ck, $cv);
+            }
+
             // Apply meta overrides (after copy + reset, so caller wins)
             $overrides_applied = [];
             foreach ($meta_overrides as $key => $value) {
@@ -264,20 +278,72 @@ add_action('rest_api_init', function () {
                 }
             }
 
+            $final_slug = get_post_field('post_name', $new_id);
+
             return [
                 'ok'                  => true,
                 'new_id'              => $new_id,
-                'new_slug'            => get_post_field('post_name', $new_id),
+                'new_slug'            => $final_slug,
                 'status'               => get_post_status($new_id),
                 'title'                => get_the_title($new_id),
                 'edit_url'             => admin_url("post.php?post={$new_id}&action=edit"),
                 'preview_link'         => get_preview_post_link($new_id),
+                // Clean URL the slug resolves to once published. Built from
+                // the IR archive base so it's correct even while still draft
+                // (get_permalink() returns the ?p=ID form for drafts).
+                'public_url'           => home_url("/become-a-member-ets/institutions/{$final_slug}/"),
                 'source_id'            => $source_id,
                 'content_replacements' => array_keys($content_replacements),
                 'counters_reset'       => array_keys($counter_resets),
+                'cohort_cleared'       => array_keys($cohort_clears),
                 'meta_overrides'       => $overrides_applied,
                 'taxonomies_copied'    => $tax_copied,
-                'note'                 => "Duplicated as {$status}. Counters reset to 0. Review at the edit_url before publishing.",
+                'note'                 => "Duplicated as {$status}. Counters reset to 0 and per-cohort fields (registered_member_list, form_entry_id) cleared. Review at the edit_url before publishing.",
+            ];
+        },
+    ]);
+
+    // POST /institutional/<id>/meta — write postmeta on an existing IR post
+    // without re-cloning. Lets us correct institution_name, whitelisted_email,
+    // registration_limit, welcome_page, ToS text, etc. on a draft or live
+    // page. Works at update_post_meta() level so it can write keys the
+    // default wp/v2 REST hides.
+    register_rest_route('xen/v1', '/institutional/(?P<id>\d+)/meta', [
+        'methods'             => 'POST',
+        'permission_callback' => function () {
+            return current_user_can('edit_posts');
+        },
+        'callback' => function ($req) {
+            $id   = (int) $req['id'];
+            $post = get_post($id);
+            if (!$post || $post->post_type !== 'xen_institutional') {
+                return new WP_Error('not_found', 'Institutional post not found', ['status' => 404]);
+            }
+
+            $meta = $req->get_param('meta');
+            if (!is_array($meta) || empty($meta)) {
+                return new WP_Error('bad_request', 'meta must be a non-empty object of key=>value pairs', ['status' => 400]);
+            }
+
+            $updated = [];
+            $skipped = [];
+            foreach ($meta as $key => $value) {
+                // Refuse WP-private keys (_edit_lock, _thumbnail_id, etc.) so
+                // a stray override can't clobber WordPress internals.
+                if (strncmp($key, '_', 1) === 0) {
+                    $skipped[] = $key;
+                    continue;
+                }
+                update_post_meta($id, $key, $value);
+                $updated[] = $key;
+            }
+
+            return [
+                'ok'           => true,
+                'id'           => $id,
+                'meta_updated' => $updated,
+                'meta_skipped' => $skipped,
+                'edit_url'     => admin_url("post.php?post={$id}&action=edit"),
             ];
         },
     ]);
