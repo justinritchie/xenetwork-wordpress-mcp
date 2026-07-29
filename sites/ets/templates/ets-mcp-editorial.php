@@ -255,24 +255,127 @@ function ets_mcp_wsal_meta_for($ids) {
  * substitution would silently drift from WSAL's own output.
  */
 function ets_mcp_wsal_alert_info($alert_id) {
-    $info = array('label' => null, 'template' => null, 'rendered' => false);
+    static $cache = array();
+    if (isset($cache[$alert_id])) {
+        return $cache[$alert_id];
+    }
+
+    $info = array('label' => null, 'template' => null, 'rendered' => false,
+                  'via' => null);
+
+    // WSAL has moved its alert registry more than once across majors, so try
+    // the known shapes in order rather than betting on one. Deliberately NO
+    // hardcoded fallback table of code->label: a wrong label in an evidence
+    // tool is worse than an honest null, because it reads as authoritative.
+    $attempts = array();
+
     try {
+        // 4.x / 5.x: singleton with an alert manager.
         if (class_exists('WpSecurityAuditLog')) {
-            $wsal = WpSecurityAuditLog::GetInstance();
-            if (isset($wsal->alerts) && method_exists($wsal->alerts, 'GetAlert')) {
-                $a = $wsal->alerts->GetAlert($alert_id);
-                if ($a) {
-                    $info['label'] = isset($a->desc) ? $a->desc : (isset($a->title) ? $a->title : null);
-                    $info['template'] = isset($a->mesg) ? $a->mesg : null;
-                    $info['rendered'] = true;
+            $attempts[] = 'WpSecurityAuditLog exists';
+            $wsal = null;
+            if (method_exists('WpSecurityAuditLog', 'GetInstance')) {
+                $wsal = WpSecurityAuditLog::GetInstance();
+                $attempts[] = 'GetInstance ok';
+            } elseif (function_exists('wsal_freemius')) {
+                $attempts[] = 'freemius present but no GetInstance';
+            }
+            if ($wsal) {
+                $mgr = null;
+                foreach (array('alerts', 'alert_manager') as $prop) {
+                    if (isset($wsal->$prop)) {
+                        $mgr = $wsal->$prop;
+                        $attempts[] = "manager via ->$prop";
+                        break;
+                    }
+                }
+                if ($mgr) {
+                    foreach (array('GetAlert', 'get_alert') as $meth) {
+                        if (method_exists($mgr, $meth)) {
+                            $a = $mgr->$meth($alert_id);
+                            if ($a) {
+                                $info['label'] = isset($a->desc) ? $a->desc
+                                    : (isset($a->title) ? $a->title : null);
+                                $info['template'] = isset($a->mesg) ? $a->mesg : null;
+                                $info['rendered'] = true;
+                                $info['via'] = "manager::$meth";
+                            }
+                            $attempts[] = "$meth called";
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            $attempts[] = 'WpSecurityAuditLog NOT loaded in this request';
+        }
+
+        // 5.x namespaced static registry.
+        if (!$info['rendered']) {
+            foreach (array('\WSAL\Helpers\Woocommerce_Helper',
+                           '\WSAL\Controllers\Alert',
+                           '\WSAL\Entities\Metadata_Entity') as $cls) {
+                if (class_exists($cls)) {
+                    $attempts[] = "namespaced class present: $cls";
+                }
+            }
+            if (class_exists('\WSAL\Controllers\Alert')) {
+                $c = '\WSAL\Controllers\Alert';
+                foreach (array('get_alert', 'get_alert_details') as $meth) {
+                    if (method_exists($c, $meth)) {
+                        $a = $c::$meth($alert_id);
+                        if ($a) {
+                            $info['label'] = is_array($a)
+                                ? (isset($a['desc']) ? $a['desc'] : (isset($a['title']) ? $a['title'] : null))
+                                : (isset($a->desc) ? $a->desc : null);
+                            $info['template'] = is_array($a)
+                                ? (isset($a['mesg']) ? $a['mesg'] : null)
+                                : (isset($a->mesg) ? $a->mesg : null);
+                            $info['rendered'] = (bool) $info['label'];
+                            $info['via'] = "Alert::$meth";
+                        }
+                        $attempts[] = "Alert::$meth called";
+                        break;
+                    }
                 }
             }
         }
     } catch (\Throwable $e) {
-        // Never let a WSAL internals change break a read.
         $info['error'] = $e->getMessage();
     }
+
+    $info['lookup_attempts'] = $attempts;
+    $cache[$alert_id] = $info;
     return $info;
+}
+
+/**
+ * One-shot diagnostic: what WSAL surface is actually reachable from a REST
+ * request? Labels came back null on first deploy and guessing why would just
+ * cost another deploy cycle, so report the facts instead.
+ */
+function ets_mcp_wsal_integration_report() {
+    $classes = array(
+        'WpSecurityAuditLog', 'WSAL_AlertManager', 'WSAL_Alert',
+        '\WSAL\Controllers\Alert', '\WSAL\Entities\Occurrences_Entity',
+    );
+    $out = array('active_plugins_hint' => null, 'classes' => array(),
+                 'functions' => array());
+    foreach ($classes as $c) {
+        $out['classes'][$c] = class_exists($c);
+    }
+    foreach (array('wsal_freemius', 'wsal_init') as $f) {
+        $out['functions'][$f] = function_exists($f);
+    }
+    if (function_exists('get_option')) {
+        $ap = get_option('active_plugins', array());
+        $net = is_multisite() ? array_keys((array) get_site_option('active_sitewide_plugins', array())) : array();
+        $all = array_merge((array) $ap, $net);
+        $out['active_plugins_hint'] = array_values(array_filter($all, function ($p) {
+            return stripos($p, 'wsal') !== false || stripos($p, 'activity-log') !== false;
+        }));
+    }
+    return $out;
 }
 
 add_action('rest_api_init', function () {
@@ -545,6 +648,7 @@ add_action('rest_api_init', function () {
                 'history_days' => ($oldest && $newest)
                     ? round(($newest - $oldest) / 86400, 1) : null,
                 'total_events' => $total,
+                'wsal_integration' => ets_mcp_wsal_integration_report(),
                 'warning' => $pruning_on
                     ? 'PRUNING IS ACTIVE. History is being deleted on a rolling '
                       . 'basis and anything already pruned is unrecoverable. If '

@@ -1280,7 +1280,28 @@ async def get_activity_log(
     exclude_event_ids: Any = None,
     event_ids: Any = None,
     limit: int = 100,
+    all_users: bool = False,
 ) -> dict | str:
+    # SCOPE DISCIPLINE. This log holds ~2,000,000 events across ~2 years, and a
+    # typical week is ~87,000 of which roughly 69% are botnet failed logins and
+    # most of the remainder are `System` rows. An unscoped pull is therefore
+    # both useless (signal buried) and disproportionate (it sweeps up unrelated
+    # activity by everyone). Scoping to one account is the normal case, so it
+    # is required rather than merely encouraged; a site-wide sweep stays
+    # possible but has to be asked for deliberately via all_users=True.
+    if not username and not all_users:
+        return {
+            "ok": False,
+            "reason": "username is required. This log holds ~2M events and a "
+                      "typical week is ~87k, mostly botnet failed logins and "
+                      "System rows — an unscoped pull buries the signal and "
+                      "sweeps in unrelated activity. Pass username='...' to "
+                      "scope it, or all_users=True if you genuinely need a "
+                      "site-wide sweep.",
+            "hint": "Use get_activity_log_summary(all_users=True) first if you "
+                    "want volume by event code before narrowing.",
+        }
+
     excl = _int_list(exclude_event_ids)
     if excl is None:                    # not supplied at all -> default
         excl = [1002, 1003]
@@ -1321,8 +1342,23 @@ async def get_activity_log(
     ),
 )
 async def get_activity_log_summary(
-    since: str | None = None, username: str | None = None
+    since: str | None = None,
+    username: str | None = None,
+    all_users: bool = False,
 ) -> dict | str:
+    # Summary is the one place a site-wide view is genuinely useful — it is
+    # counts, not content, so it reveals volume without sweeping up anyone's
+    # activity in detail. It still has to be asked for, so the scoped case
+    # stays the default and nobody reaches for a broad pull out of habit.
+    if not username and not all_users:
+        return {
+            "ok": False,
+            "reason": "username is required, or pass all_users=True. A "
+                      "site-wide summary is counts only (no event detail), so "
+                      "it is a reasonable first look when you want to see "
+                      "volume by event code — but it should be a deliberate "
+                      "choice, not the default.",
+        }
     params: dict[str, Any] = {}
     if since:
         params["since"] = since
