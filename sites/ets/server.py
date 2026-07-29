@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
 from typing import Any
@@ -902,6 +903,293 @@ async def get_form_entry(entry_id: str) -> dict | str:
     except Exception as e:
         return _err("get_form_entry", e)
     return _trim_form_entry(r.json())
+
+
+# ---------------------------------------------------------------------------
+# Editorial state: revisions, autosaves, edit locks
+#
+# All read-only. Nothing below can modify a post: every call is a GET, and the
+# edit-lock/enclosure data comes from a computed REST field that has no
+# update_callback, so there is no write path to misuse.
+#
+# WHAT THE REST API ACTUALLY SUPPORTS HERE (verified 2026-07-28 against this
+# install, not assumed):
+#   * xen_episodes declares supports: revisions AND autosave, and
+#     /episodes/<id>/revisions returns 200 with real revisions. The concern
+#     that a custom post type would 404 on /revisions does not apply here.
+#   * /episodes/<id>/autosaves returns 200. It is EMPTY unless an editor has
+#     made a change in the block editor — WordPress keeps at most one autosave
+#     per user per post, and only once something has actually been typed.
+#   * `_edit_lock` and `_edit_last` are protected meta and are NOT returned by
+#     core REST. GET /episodes/4425?context=edit returned meta keys
+#     ['_acf_changed', 'footnotes'] and nothing else. Reading them requires the
+#     ets-mcp-editorial.php mu-plugin (see templates/), which exposes them as a
+#     computed `mcp_editorial` field. The two tools that need it say so
+#     explicitly when it is missing rather than returning a confusing empty
+#     result.
+# ---------------------------------------------------------------------------
+
+_USER_CACHE: dict[int, dict] = {}
+
+
+async def _resolve_user(user_id: int | None) -> dict | None:
+    """Resolve a WP user id to a readable identity, cached for the process.
+
+    Revision lists repeat the same author on every entry; without a cache a
+    10-revision list would issue 10 identical /users lookups.
+    """
+    if not user_id:
+        return None
+    uid = int(user_id)
+    if uid in _USER_CACHE:
+        return _USER_CACHE[uid]
+    try:
+        r = await client.get(f"/users/{uid}", params={"context": "edit"})
+        r.raise_for_status()
+        u = r.json()
+        out = {
+            "user_id": uid,
+            "name": u.get("name"),
+            "slug": u.get("slug"),
+            "email": u.get("email"),
+        }
+    except Exception:
+        # A missing or unreadable user must not fail the whole call — the
+        # revision itself is still real and still worth returning.
+        out = {"user_id": uid, "name": None, "unresolved": True}
+    _USER_CACHE[uid] = out
+    return out
+
+
+def _excerpt(html: str | None, limit: int = 400) -> str | None:
+    if not html:
+        return None
+    text = re.sub(r"<[^>]+>", " ", html)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+@mcp.tool(
+    description=(
+        "List saved revisions for an ETS episode, newest first. Read-only.\n"
+        "\n"
+        "Each entry gives the revision id, resolved author, date/modified "
+        "timestamps, title, and a plain-text excerpt of the body. Use "
+        "get_episode_revision for the full content of one revision.\n"
+        "\n"
+        "Revisions are SAVED history. For changes typed but not yet saved, "
+        "use get_episode_autosave instead."
+    ),
+)
+async def list_episode_revisions(id: int, limit: int = 20) -> dict | str:
+    try:
+        r = await client.get(
+            f"/episodes/{id}/revisions",
+            params={"per_page": max(1, min(limit, 100)), "context": "edit"},
+        )
+        r.raise_for_status()
+    except Exception as e:
+        return _err("list_episode_revisions", e)
+
+    items = r.json()
+    if not isinstance(items, list):
+        return {"ok": False, "error": "unexpected response shape", "raw": items}
+
+    out = []
+    for rev in items:
+        out.append({
+            "revision_id": rev.get("id"),
+            "parent": rev.get("parent"),
+            "author": await _resolve_user(rev.get("author")),
+            "date_gmt": rev.get("date_gmt"),
+            "modified_gmt": rev.get("modified_gmt"),
+            "title": (rev.get("title") or {}).get("rendered"),
+            "excerpt": _excerpt((rev.get("content") or {}).get("rendered")),
+        })
+    out.sort(key=lambda x: x.get("modified_gmt") or "", reverse=True)
+    return {"ok": True, "episode_id": id, "count": len(out), "revisions": out}
+
+
+@mcp.tool(
+    description=(
+        "Get one saved revision of an ETS episode in full — raw and rendered "
+        "content, title, excerpt, resolved author, and timestamps. Read-only. "
+        "Get revision ids from list_episode_revisions."
+    ),
+)
+async def get_episode_revision(id: int, revision_id: int) -> dict | str:
+    try:
+        r = await client.get(
+            f"/episodes/{id}/revisions/{revision_id}",
+            params={"context": "edit"},
+        )
+        r.raise_for_status()
+    except Exception as e:
+        return _err("get_episode_revision", e)
+
+    rev = r.json()
+    content = rev.get("content") or {}
+    title = rev.get("title") or {}
+    return {
+        "ok": True,
+        "episode_id": id,
+        "revision_id": rev.get("id"),
+        "author": await _resolve_user(rev.get("author")),
+        "date_gmt": rev.get("date_gmt"),
+        "modified_gmt": rev.get("modified_gmt"),
+        "title_raw": title.get("raw"),
+        "title_rendered": title.get("rendered"),
+        "content_raw": content.get("raw"),
+        "content_rendered": content.get("rendered"),
+        "excerpt": (rev.get("excerpt") or {}).get("rendered"),
+    }
+
+
+@mcp.tool(
+    description=(
+        "Get the PENDING AUTOSAVE for an ETS episode — content typed into the "
+        "block editor but not yet saved or published. Read-only.\n"
+        "\n"
+        "This is the earliest available signal that someone is drafting a "
+        "change, well before the post's `modified` timestamp moves.\n"
+        "\n"
+        "An empty result is a normal, meaningful answer: WordPress stores at "
+        "most one autosave per user per post and creates it only once the "
+        "editor has actually changed something. An open editor with no edits "
+        "produces nothing. Empty means 'nothing pending', NOT an error."
+    ),
+)
+async def get_episode_autosave(id: int) -> dict | str:
+    try:
+        r = await client.get(
+            f"/episodes/{id}/autosaves", params={"context": "edit"}
+        )
+        r.raise_for_status()
+    except Exception as e:
+        return _err("get_episode_autosave", e)
+
+    items = r.json()
+    lst = items if isinstance(items, list) else [items]
+    if not lst:
+        return {
+            "ok": True,
+            "episode_id": id,
+            "autosave_present": False,
+            "note": "No pending autosave. Either nobody is editing, or the "
+                    "editor is open but nothing has been changed yet.",
+        }
+
+    out = []
+    for a in lst:
+        content = a.get("content") or {}
+        title = a.get("title") or {}
+        out.append({
+            "autosave_id": a.get("id"),
+            "author": await _resolve_user(a.get("author")),
+            "modified_gmt": a.get("modified_gmt"),
+            "date_gmt": a.get("date_gmt"),
+            "title_raw": title.get("raw") or title.get("rendered"),
+            "content_raw": content.get("raw") or content.get("rendered"),
+            "excerpt": _excerpt(content.get("rendered") or content.get("raw")),
+        })
+    return {
+        "ok": True,
+        "episode_id": id,
+        "autosave_present": True,
+        "count": len(out),
+        "autosaves": out,
+    }
+
+
+_MU_PLUGIN_HINT = (
+    "`mcp_editorial` is not present on the episode payload. That field comes "
+    "from the ets-mcp-editorial.php mu-plugin, which has not been deployed to "
+    "this site yet. `_edit_lock`/`_edit_last` and the PowerPress enclosure keys "
+    "are protected meta and are NOT readable through core REST without it — "
+    "this is a deployment gap, not a permissions or code failure. The plugin "
+    "file is in the MCP repo under sites/ets/templates/; drop it into "
+    "wp-content/mu-plugins/ on the ETS subsite."
+)
+
+
+async def _editorial_field(id: int) -> tuple[dict | None, str | None]:
+    """Fetch the computed mcp_editorial field, or explain why it isn't there."""
+    try:
+        r = await client.get(f"/episodes/{id}", params={"context": "edit"})
+        r.raise_for_status()
+    except Exception as e:
+        return None, _err("get_episode(edit context)", e)
+    d = r.json()
+    if "mcp_editorial" not in d:
+        return None, _MU_PLUGIN_HINT
+    return d.get("mcp_editorial"), None
+
+
+@mcp.tool(
+    description=(
+        "Show who currently has an ETS episode open in the block editor, and "
+        "who last saved it. Read-only. This is the programmatic form of the "
+        "'X is currently editing this post' notice in wp-admin.\n"
+        "\n"
+        "Returns the lock timestamp as ISO 8601 plus its age in seconds. "
+        "WordPress treats a lock older than ~150 seconds as stale, so age "
+        "matters more than presence — a lock can outlive the editing session."
+    ),
+)
+async def get_episode_lock(id: int) -> dict | str:
+    field, problem = await _editorial_field(id)
+    if problem:
+        return {"ok": False, "episode_id": id, "reason": problem}
+    if not field:
+        return {
+            "ok": False,
+            "episode_id": id,
+            "reason": "mcp_editorial returned null — the Application Password "
+                      "user lacks edit_post on this episode, so the field is "
+                      "withheld by design.",
+        }
+    lock = field.get("edit_lock")
+    return {
+        "ok": True,
+        "episode_id": id,
+        "locked": bool(lock),
+        "lock": lock,
+        "last_editor": field.get("edit_last"),
+        "server_time": field.get("server_time"),
+        "note": None if lock else "No edit lock set — nobody has the post open, "
+                                  "or the lock has already been cleared.",
+    }
+
+
+@mcp.tool(
+    description=(
+        "Read the podcast enclosure meta for an ETS episode (PowerPress) so "
+        "the audio URL comes from post meta rather than being scraped out of "
+        "rendered HTML. Read-only. Returns whichever enclosure keys are "
+        "actually populated on this install, with the key name each value "
+        "came from."
+    ),
+)
+async def get_episode_media_meta(id: int) -> dict | str:
+    field, problem = await _editorial_field(id)
+    if problem:
+        return {"ok": False, "episode_id": id, "reason": problem}
+    if not field:
+        return {
+            "ok": False,
+            "episode_id": id,
+            "reason": "mcp_editorial returned null — insufficient capability "
+                      "on this episode.",
+        }
+    enc = field.get("enclosure")
+    return {
+        "ok": True,
+        "episode_id": id,
+        "enclosure_present": bool(enc),
+        "enclosure": enc,
+        "note": None if enc else "No enclosure/powerpress meta found on this "
+                                 "episode.",
+    }
 
 
 if __name__ == "__main__":

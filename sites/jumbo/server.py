@@ -46,16 +46,20 @@ Run with:
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import os
 import re
 import sys
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
 from fastmcp import FastMCP
+from pydantic import BeforeValidator
 
 
 PORT = int(os.environ.get("WP_MCP_PORT", "8003"))
@@ -753,6 +757,417 @@ async def search_options(
     data["_meta"] = _meta(_active())
     return data
 # <<< css-options-tools (managed by claude) <<<
+
+
+# >>> user-meta-write-tools (managed by claude) >>>
+# =============================================================================
+# Scoped user-meta WRITE surface — allowlisted, site-explicit, dry-run default
+# =============================================================================
+#
+# The ONLY write capability in this otherwise read-only server. Sets a single
+# allowlisted user-meta key on known users, one EXPLICIT site at a time.
+#
+# Hard rules (see SECURITY.md):
+#   - `site` is REQUIRED and explicit on every write tool; NEVER inferred from
+#     the ambient active site (_active()). Prevents flipping meta on the wrong
+#     event's registrants — an unrecoverable-without-DB-restore failure.
+#   - Only keys in WRITABLE_META_KEYS may be written; anything else is refused
+#     with zero HTTP calls.
+#   - dry_run defaults to True; a caller must pass dry_run=False to mutate.
+#     The dry run does the full resolution + old-value read, so the preview is
+#     real, not hypothetical.
+#   - Every write is post-verified: the value is read back from WP and only
+#     reported `applied` if the readback matches, else `write_unconfirmed`.
+#     WordPress silently 200s and DISCARDS meta whose key is NOT registered
+#     with show_in_rest — the returned representation still shows the old value,
+#     so the readback catches it. Ship templates/jumbo-mcp-meta.php per site.
+#   - Bulk resolves ALL identifiers before writing any; aborts the whole batch
+#     on any unresolved identifier unless allow_partial=True. Never half-applies.
+
+WRITABLE_META_KEYS = set(
+    k.strip()
+    for k in os.environ.get("WP_WRITABLE_META_KEYS", "event_registration_status").split(",")
+    if k.strip()
+)
+
+
+def _coerce_list(v):
+    """Accept a real list, a JSON-encoded list string, or a comma-separated string.
+
+    Why: MCP clients commonly serialize array arguments as a JSON *string*, and
+    pydantic v2 strict mode rejects that with "Input should be a valid list"
+    before the tool body ever runs (see tasks/lessons.md). Coercing here keeps
+    the batch tools callable from any client without loosening the schema.
+    """
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return []
+        try:
+            parsed = json.loads(s)
+        except Exception:
+            return [x.strip() for x in s.split(",") if x.strip()]
+        return parsed if isinstance(parsed, list) else [parsed]
+    return v
+
+
+# Batch identifier params — tolerant of JSON-string input from MCP clients.
+EmailList = Annotated[list[str] | None, BeforeValidator(_coerce_list)]
+UserIdList = Annotated[list[int] | None, BeforeValidator(_coerce_list)]
+
+# Bounded concurrency + backoff so a 150-user batch never hammers WP Engine.
+_WRITE_CONCURRENCY = max(1, int(os.environ.get("WP_WRITE_CONCURRENCY", "4")))
+_RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+def _resolve_site(name: str) -> SiteConfig:
+    """Explicit site resolution for WRITE paths. Raises ValueError on unknown.
+
+    Deliberately does NOT fall back to _active() — write tools must name their
+    target site so a batch can never land on the wrong event's registrants.
+    """
+    key = (name or "").strip().lower()
+    if key not in SITES:
+        raise ValueError(
+            f"unknown site '{name}'. Configured: {', '.join(sorted(SITES))}. "
+            f"Write tools require an explicit, known site and never fall back "
+            f"to the active site."
+        )
+    return SITES[key]
+
+
+def _site_auth(site: SiteConfig) -> dict[str, str]:
+    """Auth header for an EXPLICIT site (not the active one)."""
+    return {"Authorization": site.auth_header}
+
+
+async def _get_site(site: SiteConfig, path: str, params: dict | None = None) -> httpx.Response:
+    """GET against an EXPLICIT site (not _active())."""
+    return await client.get(f"{site.base}{path}", params=params, headers=_site_auth(site))
+
+
+async def _post_site(
+    site: SiteConfig, path: str, json_body: dict, params: dict | None = None
+) -> httpx.Response:
+    """POST JSON against an EXPLICIT site, retrying 429/5xx with exponential backoff.
+
+    httpx sets Content-Type: application/json from json=. Returns the final
+    response; the caller inspects status (never half-swallows an error).
+    """
+    url = f"{site.base}{path}"
+    headers = _site_auth(site)
+    delay = 1.0
+    resp: httpx.Response | None = None
+    for attempt in range(4):
+        resp = await client.post(url, json=json_body, params=params, headers=headers)
+        if resp.status_code not in _RETRY_STATUSES:
+            return resp
+        if attempt < 3:
+            await asyncio.sleep(delay)
+            delay *= 2
+    return resp  # retries exhausted; still a real Response for the caller
+
+
+def _audit(site: SiteConfig, tool: str, user_id: Any, key: str, old: Any, new: Any, result: str) -> None:
+    """One structured audit line to stderr per write attempt. No credentials."""
+    print(
+        f"[wp-jumbo-mcp][AUDIT] ts={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+        f"site={site.name} tool={tool} user_id={user_id} key={key} "
+        f"old={old!r} new={new!r} result={result}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _summarize(rows: list[dict]) -> dict:
+    """Derive the batch summary purely from final row statuses."""
+    def n(status: str) -> int:
+        return sum(1 for r in rows if r["status"] == status)
+    return {
+        "total": len(rows),
+        "resolved": sum(1 for r in rows if r["status"] != "unresolved"),
+        "unresolved": n("unresolved"),
+        "already_set": n("already_set"),
+        "would_change": n("would_change"),
+        "applied": n("applied"),
+        "write_unconfirmed": n("write_unconfirmed"),
+        "failed": n("failed"),
+    }
+
+
+def _exact_match(results: list[dict], email: str) -> tuple[int | None, str, dict]:
+    """From a WP /users?search result, find the EXACTLY-one exact-email match.
+
+    Returns (user_id, status, meta). status in {ok, not_found, ambiguous}.
+    WP search is fuzzy (email/name/slug), so we filter to exact email here.
+    """
+    tgt = email.strip().lower()
+    exact = [u for u in results if str(u.get("email", "")).strip().lower() == tgt]
+    if len(exact) == 1:
+        return int(exact[0]["id"]), "ok", (exact[0].get("meta") or {})
+    if not exact:
+        return None, "not_found", {}
+    return None, "ambiguous", {}
+
+
+async def _resolve_email(site: SiteConfig, email: str) -> tuple[int | None, str, dict]:
+    """Resolve one email -> (user_id, status, meta) against an EXPLICIT site."""
+    try:
+        r = await _get_site(site, "/users", {"search": email, "context": "edit", "per_page": 10})
+        r.raise_for_status()
+    except Exception as e:  # noqa: BLE001 — surfaced as a row status
+        return None, f"error:{type(e).__name__}", {}
+    return _exact_match(r.json(), email)
+
+
+@mcp.tool(
+    description=(
+        "Set a single allowlisted user-meta key on ONE user of an EXPLICIT "
+        "Jumbo client site. Dry-run by default — you must pass dry_run=False "
+        "to actually write.\n"
+        "\n"
+        "Primary use: flip `event_registration_status` (blank=pending, "
+        "'confirmed-N'=confirmed in batch N) that audience segments key off.\n"
+        "\n"
+        "Args:\n"
+        "  site: REQUIRED site name from list_sites (e.g. 'lcatt'). Never "
+        "inferred from the active site.\n"
+        "  key: meta key; must be in the server's WRITABLE_META_KEYS allowlist.\n"
+        "  value: the string value to set.\n"
+        "  user_id | email: provide EXACTLY ONE. email resolves to exactly one "
+        "exact-match user or errors.\n"
+        "  dry_run: default True. Reads the real current value and reports what "
+        "WOULD change without writing.\n"
+        "\n"
+        "Returns {site, user_id, email, key, old_value, new_value, status, "
+        "applied, dry_run}. status is one of would_change / already_set / "
+        "applied / write_unconfirmed / not_found / ambiguous / an error string. "
+        "A write is `applied` ONLY if the post-write readback matches; a WP "
+        "silent-discard (unregistered meta key) surfaces as write_unconfirmed."
+    ),
+)
+async def update_user_meta(
+    site: str,
+    key: str,
+    value: str,
+    user_id: int | None = None,
+    email: str | None = None,
+    dry_run: bool = True,
+) -> dict:
+    if key not in WRITABLE_META_KEYS:
+        return {
+            "error": f"key '{key}' is not writable. Allowlist: {sorted(WRITABLE_META_KEYS)}.",
+            "key": key, "applied": False, "dry_run": dry_run,
+        }
+    try:
+        s = _resolve_site(site)
+    except ValueError as e:
+        return {"error": str(e), "applied": False, "dry_run": dry_run}
+    if (user_id is None) == (email is None):
+        return {
+            "error": "provide EXACTLY ONE of user_id or email.",
+            "site": s.name, "applied": False, "dry_run": dry_run,
+        }
+
+    resolved_email = email
+    if email is not None:
+        uid, status, meta = await _resolve_email(s, email)
+        if status != "ok":
+            return {
+                "site": s.name, "user_id": None, "email": email, "key": key,
+                "old_value": None, "new_value": value, "status": status,
+                "applied": False, "dry_run": dry_run,
+            }
+    else:
+        uid = int(user_id)  # type: ignore[arg-type]
+        try:
+            r = await _get_site(s, f"/users/{uid}", {"context": "edit"})
+            r.raise_for_status()
+            meta = r.json().get("meta") or {}
+        except Exception as e:  # noqa: BLE001
+            return {
+                "site": s.name, "user_id": uid, "email": None, "key": key,
+                "new_value": value, "status": _err("update_user_meta.read", e),
+                "applied": False, "dry_run": dry_run,
+            }
+
+    old_value = meta.get(key)
+
+    if old_value == value:
+        return {
+            "site": s.name, "user_id": uid, "email": resolved_email, "key": key,
+            "old_value": old_value, "new_value": value, "status": "already_set",
+            "applied": False, "dry_run": dry_run,
+        }
+
+    if dry_run:
+        return {
+            "site": s.name, "user_id": uid, "email": resolved_email, "key": key,
+            "old_value": old_value, "new_value": value, "status": "would_change",
+            "applied": False, "dry_run": True,
+        }
+
+    try:
+        pr = await _post_site(s, f"/users/{uid}", {"meta": {key: value}}, params={"context": "edit"})
+        pr.raise_for_status()
+        readback = (pr.json().get("meta") or {}).get(key)
+    except Exception as e:  # noqa: BLE001
+        _audit(s, "update_user_meta", uid, key, old_value, value, "failed")
+        return {
+            "site": s.name, "user_id": uid, "email": resolved_email, "key": key,
+            "old_value": old_value, "new_value": value,
+            "status": _err("update_user_meta.write", e), "applied": False, "dry_run": False,
+        }
+
+    confirmed = readback == value
+    result = "applied" if confirmed else "write_unconfirmed"
+    _audit(s, "update_user_meta", uid, key, old_value, value, result)
+    return {
+        "site": s.name, "user_id": uid, "email": resolved_email, "key": key,
+        "old_value": old_value, "new_value": value, "readback": readback,
+        "status": result, "applied": confirmed, "dry_run": False,
+    }
+
+
+@mcp.tool(
+    description=(
+        "Set a single allowlisted user-meta key+value on a BATCH of users of an "
+        "EXPLICIT Jumbo client site. Dry-run by default. Resolves ALL users "
+        "first and aborts the whole batch on any unresolved identifier unless "
+        "allow_partial=True — never half-applies silently.\n"
+        "\n"
+        "Primary use: confirm a client-supplied list of registrant emails into "
+        "batch N by setting event_registration_status='confirmed-N'.\n"
+        "\n"
+        "Args:\n"
+        "  site: REQUIRED site name (e.g. 'lcatt').\n"
+        "  key: meta key; must be in WRITABLE_META_KEYS.\n"
+        "  value: single value applied to the whole batch.\n"
+        "  emails | user_ids: provide EXACTLY ONE list. Empty list is a no-op "
+        "(zeros summary, no HTTP calls).\n"
+        "  dry_run: default True. Full resolve + old-value read, no writes.\n"
+        "  allow_partial: default False. If False, ANY unresolved identifier "
+        "aborts the batch before writing.\n"
+        "  max_batch: default 250. A larger batch is REFUSED (not truncated).\n"
+        "\n"
+        "Returns {site, key, value, dry_run, summary{resolved, unresolved, "
+        "already_set, would_change, applied, write_unconfirmed, failed}, rows:"
+        "[{email, user_id, old_value, status, ...}]}. Each write is readback-"
+        "verified; silent-discard writes surface as write_unconfirmed."
+    ),
+)
+async def bulk_update_user_meta(
+    site: str,
+    key: str,
+    value: str,
+    emails: EmailList = None,
+    user_ids: UserIdList = None,
+    dry_run: bool = True,
+    allow_partial: bool = False,
+    max_batch: int = 250,
+) -> dict:
+    # Defence in depth: the Annotated BeforeValidator handles JSON-string args
+    # coming through pydantic, but coerce again here so the tool is also correct
+    # when called directly (tests, CLI, any path that skips validation).
+    emails = _coerce_list(emails)
+    user_ids = _coerce_list(user_ids)
+
+    if key not in WRITABLE_META_KEYS:
+        return {"error": f"key '{key}' is not writable. Allowlist: {sorted(WRITABLE_META_KEYS)}.",
+                "key": key, "dry_run": dry_run}
+    try:
+        s = _resolve_site(site)
+    except ValueError as e:
+        return {"error": str(e), "dry_run": dry_run}
+
+    have_emails = bool(emails)
+    have_ids = bool(user_ids)
+    if have_emails and have_ids:
+        return {"error": "provide EXACTLY ONE of emails or user_ids, not both.",
+                "site": s.name, "dry_run": dry_run}
+    if not have_emails and not have_ids:
+        # No-op on empty (explicit empty list or nothing) — zeros, no HTTP calls.
+        return {"site": s.name, "key": key, "value": value, "dry_run": dry_run,
+                "summary": _summarize([]), "rows": []}
+
+    identifiers: list = list(emails) if have_emails else list(user_ids)  # type: ignore[arg-type]
+    if len(identifiers) > max_batch:
+        return {"error": f"batch of {len(identifiers)} exceeds max_batch={max_batch}. "
+                         f"Refusing (never silently truncated).",
+                "site": s.name, "dry_run": dry_run}
+
+    sem = asyncio.Semaphore(_WRITE_CONCURRENCY)
+
+    async def resolve_one(idx: int, ident) -> tuple[int, dict, int | None]:
+        async with sem:
+            if have_emails:
+                uid, status, meta = await _resolve_email(s, ident)
+                row: dict = {"email": ident, "user_id": uid}
+            else:
+                uid = int(ident)
+                status = "ok"
+                meta = {}
+                try:
+                    r = await _get_site(s, f"/users/{uid}", {"context": "edit"})
+                    r.raise_for_status()
+                    meta = r.json().get("meta") or {}
+                except Exception as e:  # noqa: BLE001
+                    status = f"error:{type(e).__name__}"
+                row = {"email": None, "user_id": uid}
+            if status != "ok":
+                row.update({"old_value": None, "status": "unresolved", "detail": status})
+                return idx, row, None
+            old = meta.get(key)
+            row["old_value"] = old
+            row["status"] = "already_set" if old == value else "would_change"
+            return idx, row, uid
+
+    resolved = await asyncio.gather(*(resolve_one(i, ident) for i, ident in enumerate(identifiers)))
+    resolved.sort(key=lambda t: t[0])
+    rows = [r for _, r, _ in resolved]
+    uid_by_idx = {i: uid for i, _, uid in resolved}
+
+    unresolved = [r for r in rows if r["status"] == "unresolved"]
+    if unresolved and not allow_partial:
+        return {
+            "site": s.name, "key": key, "value": value, "dry_run": dry_run, "aborted": True,
+            "reason": (f"{len(unresolved)} of {len(rows)} identifiers did not resolve to exactly "
+                       f"one user; batch aborted. Pass allow_partial=True to write the resolved rows."),
+            "summary": _summarize(rows), "rows": rows,
+        }
+
+    if dry_run:
+        return {"site": s.name, "key": key, "value": value, "dry_run": True,
+                "summary": _summarize(rows), "rows": rows}
+
+    async def write_one(i: int, row: dict) -> None:
+        if row["status"] != "would_change":
+            return
+        uid = uid_by_idx[i]
+        async with sem:
+            try:
+                pr = await _post_site(s, f"/users/{uid}", {"meta": {key: value}}, params={"context": "edit"})
+                pr.raise_for_status()
+                readback = (pr.json().get("meta") or {}).get(key)
+            except Exception as e:  # noqa: BLE001
+                row["status"] = "failed"
+                row["detail"] = _err("bulk_update_user_meta.write", e)
+                _audit(s, "bulk_update_user_meta", uid, key, row["old_value"], value, "failed")
+                return
+            if readback == value:
+                row["status"] = "applied"
+                row["new_value"] = value
+                _audit(s, "bulk_update_user_meta", uid, key, row["old_value"], value, "applied")
+            else:
+                row["status"] = "write_unconfirmed"
+                row["readback"] = readback
+                _audit(s, "bulk_update_user_meta", uid, key, row["old_value"], value, "write_unconfirmed")
+
+    await asyncio.gather(*(write_one(i, rows[i]) for i in range(len(rows))))
+
+    return {"site": s.name, "key": key, "value": value, "dry_run": False,
+            "summary": _summarize(rows), "rows": rows}
+# <<< user-meta-write-tools (managed by claude) <<<
 
 if __name__ == "__main__":
     print(
