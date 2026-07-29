@@ -1192,6 +1192,160 @@ async def get_episode_media_meta(id: int) -> dict | str:
     }
 
 
+# ---------------------------------------------------------------------------
+# WP Activity Log (WSAL) — read-only
+#
+# WSAL free has no notification rules (Premium only), so the log has to be
+# polled rather than pushed. It is the only record of site actions that never
+# move a post's `modified` timestamp, which makes it invisible to every other
+# monitor.
+#
+# These call custom routes added by the ets-mcp-editorial.php mu-plugin, not
+# core REST — WSAL keeps occurrences in its own tables, so there is no core
+# endpoint to use. Every query behind them is a prepared SELECT; there is no
+# write path.
+# ---------------------------------------------------------------------------
+
+ETS_MCP_ROUTE = f"{WP_BASE}/wp-json/ets-mcp/v1"
+
+_WSAL_MISSING_HINT = (
+    "The ets-mcp/v1 routes are not registered on this site (404). They come "
+    "from the ets-mcp-editorial.php mu-plugin, which has not been deployed "
+    "yet — drop it into wp-content/mu-plugins/ on the ETS subsite. This is a "
+    "deployment gap, not a permissions or code failure."
+)
+
+
+def _int_list(v: Any) -> list[int] | None:
+    """Accept a real list, a JSON-encoded list string, or a comma-separated string.
+
+    MCP clients routinely serialise array arguments as a JSON *string*. Without
+    this, passing exclude_event_ids=[] to deliberately INCLUDE failed logins
+    fails in a way that looks like the filter is stuck on.
+    """
+    if v is None:
+        return None
+    if isinstance(v, list):
+        return [int(x) for x in v]
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return []
+        try:
+            import json as _json
+            parsed = _json.loads(s)
+            if isinstance(parsed, list):
+                return [int(x) for x in parsed]
+            return [int(parsed)]
+        except Exception:
+            return [int(x.strip()) for x in s.split(",") if x.strip()]
+    return [int(v)]
+
+
+async def _ets_route(path: str, params: dict) -> dict | str:
+    try:
+        r = await client.get(f"{ETS_MCP_ROUTE}{path}", params=params)
+        if r.status_code == 404:
+            return {"ok": False, "reason": _WSAL_MISSING_HINT}
+        r.raise_for_status()
+    except Exception as e:
+        return _err(f"ets-mcp{path}", e)
+    return r.json()
+
+
+@mcp.tool(
+    description=(
+        "Read WP Activity Log (WSAL) events for the ETS site, newest first. "
+        "Read-only.\n"
+        "\n"
+        "This is the only record of actions that never move a post's "
+        "`modified` timestamp — logins, role changes, plugin and settings "
+        "changes, deletions.\n"
+        "\n"
+        "Filtering is EXCLUSION-based on purpose. exclude_event_ids defaults "
+        "to [1002, 1003] (failed logins), which are high-volume noise from an "
+        "active credential-stuffing botnet. Pass exclude_event_ids=[] to see "
+        "them deliberately. There is intentionally no allowlist of "
+        "'interesting' events, because the event that matters is usually the "
+        "one nobody thought to anticipate.\n"
+        "\n"
+        "since/until accept ISO dates ('2026-07-27'), datetimes, or unix "
+        "timestamps."
+    ),
+)
+async def get_activity_log(
+    username: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    exclude_event_ids: Any = None,
+    event_ids: Any = None,
+    limit: int = 100,
+) -> dict | str:
+    excl = _int_list(exclude_event_ids)
+    if excl is None:                    # not supplied at all -> default
+        excl = [1002, 1003]
+    only = _int_list(event_ids)
+
+    params: dict[str, Any] = {"limit": max(1, min(int(limit), 500))}
+    if username:
+        params["username"] = username
+    if since:
+        params["since"] = since
+    if until:
+        params["until"] = until
+    if excl:
+        params["exclude_event_ids"] = ",".join(str(x) for x in excl)
+    if only:
+        params["event_ids"] = ",".join(str(x) for x in only)
+
+    out = await _ets_route("/activity-log", params)
+    if isinstance(out, dict) and out.get("ok") and not out.get("events"):
+        out["note"] = (
+            "No matching events. Note the default excludes failed logins "
+            "(1002/1003) — pass exclude_event_ids=[] if you expected those."
+        )
+    return out
+
+
+@mcp.tool(
+    description=(
+        "Count WSAL events grouped by event code over a window, with the "
+        "human label for each. Read-only.\n"
+        "\n"
+        "Use this before get_activity_log when the log is noisy: a "
+        "credential-stuffing botnet becomes a single row with a count of "
+        "several hundred instead of several hundred rows, and an unusual "
+        "burst of any other event type is immediately visible. Includes ALL "
+        "event codes — nothing is excluded here, because the whole point is "
+        "seeing relative volume."
+    ),
+)
+async def get_activity_log_summary(
+    since: str | None = None, username: str | None = None
+) -> dict | str:
+    params: dict[str, Any] = {}
+    if since:
+        params["since"] = since
+    if username:
+        params["username"] = username
+    return await _ets_route("/activity-log/summary", params)
+
+
+@mcp.tool(
+    description=(
+        "Report WSAL's pruning configuration and how much history actually "
+        "exists — retention period, max-event cap, oldest and newest event, "
+        "and total count. Read-only.\n"
+        "\n"
+        "Check this FIRST when the log matters as evidence. WSAL free prunes "
+        "on a rolling window by default, and anything already pruned is "
+        "unrecoverable — no tooling built on top can bring it back."
+    ),
+)
+async def get_activity_log_retention() -> dict | str:
+    return await _ets_route("/activity-log/retention", {})
+
+
 if __name__ == "__main__":
     print(
         f"[wp-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",

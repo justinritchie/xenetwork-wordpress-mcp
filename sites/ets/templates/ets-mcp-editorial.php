@@ -130,3 +130,428 @@ add_action('rest_api_init', function () {
         // not a matter of the MCP choosing not to call it.
     ));
 });
+
+
+/* =========================================================================
+ * WP Activity Log (WSAL) — read-only REST access
+ * =========================================================================
+ *
+ * WHY THIS LIVES HERE
+ *   Folded into the same mu-plugin deliberately: the editorial field above
+ *   already has to be deployed, and one file means one deploy rather than two
+ *   chances to end up half-configured.
+ *
+ * WHY REST ROUTES RATHER THAN A FIELD
+ *   WSAL keeps occurrences in its own database tables, not post meta, so there
+ *   is nothing for register_rest_field to hang off. These are custom routes
+ *   that run parameterised SELECTs.
+ *
+ * READ-ONLY IS ENFORCED, NOT PROMISED
+ *   Every statement below is a SELECT built through $wpdb->prepare. There is no
+ *   INSERT, UPDATE, DELETE or prune path anywhere in this file, and the routes
+ *   register only GET methods. This log is evidence in a live matter; it must
+ *   not be writable from here even by accident.
+ *
+ * THE MULTISITE TRAP
+ *   WSAL writes network-wide to the BASE prefix — wp_wsal_occurrences — and
+ *   identifies the subsite with a site_id column. Querying wp_2_wsal_occurrences
+ *   returns nothing and looks exactly like an empty log, which is the failure
+ *   most likely to waste an afternoon. $wpdb->base_prefix is used throughout.
+ *
+ * SCHEMA DRIFT
+ *   WSAL 4.x denormalised username / client_ip / object / event_type / severity
+ *   onto the occurrences row. Older versions keep them as key/value rows in
+ *   wsal_metadata joined on occurrence_id. The layout is DETECTED at runtime
+ *   rather than assumed, because guessing wrong yields empty columns instead of
+ *   an error, which is worse.
+ */
+
+if (!defined('ETS_MCP_NS')) {
+    define('ETS_MCP_NS', 'ets-mcp/v1');
+}
+
+/** Occurrences/metadata table names on the base prefix. */
+function ets_mcp_wsal_tables() {
+    global $wpdb;
+    return array(
+        'occ'  => $wpdb->base_prefix . 'wsal_occurrences',
+        'meta' => $wpdb->base_prefix . 'wsal_metadata',
+    );
+}
+
+function ets_mcp_wsal_table_exists($table) {
+    global $wpdb;
+    return (bool) $wpdb->get_var(
+        $wpdb->prepare('SHOW TABLES LIKE %s', $table)
+    );
+}
+
+/** Column list for the occurrences table, used for layout detection. */
+function ets_mcp_wsal_columns() {
+    global $wpdb;
+    static $cols = null;
+    if ($cols !== null) {
+        return $cols;
+    }
+    $t = ets_mcp_wsal_tables();
+    if (!ets_mcp_wsal_table_exists($t['occ'])) {
+        $cols = array();
+        return $cols;
+    }
+    // Table name comes from $wpdb->base_prefix, not user input, so it cannot be
+    // parameterised and does not need to be.
+    $cols = $wpdb->get_col('DESCRIBE ' . $t['occ'], 0);
+    if (!is_array($cols)) {
+        $cols = array();
+    }
+    return $cols;
+}
+
+/** Accept an ISO date, a date string, or a unix timestamp; return float ts. */
+function ets_mcp_to_ts($value, $default = null) {
+    if ($value === null || $value === '') {
+        return $default;
+    }
+    if (is_numeric($value)) {
+        return (float) $value;
+    }
+    $t = strtotime($value . (preg_match('/\d:\d/', $value) ? '' : ' 00:00:00 UTC'));
+    return $t ? (float) $t : $default;
+}
+
+/** Metadata rows for a set of occurrence ids, grouped by occurrence. */
+function ets_mcp_wsal_meta_for($ids) {
+    global $wpdb;
+    $out = array();
+    if (empty($ids)) {
+        return $out;
+    }
+    $t = ets_mcp_wsal_tables();
+    if (!ets_mcp_wsal_table_exists($t['meta'])) {
+        return $out;
+    }
+    $ph = implode(',', array_fill(0, count($ids), '%d'));
+    $rows = $wpdb->get_results(
+        $wpdb->prepare(
+            "SELECT occurrence_id, name, value FROM {$t['meta']} WHERE occurrence_id IN ($ph)",
+            $ids
+        ),
+        ARRAY_A
+    );
+    foreach ((array) $rows as $r) {
+        $oid = (int) $r['occurrence_id'];
+        $val = maybe_unserialize($r['value']);
+        $out[$oid][$r['name']] = $val;
+    }
+    return $out;
+}
+
+/**
+ * Human label / message for an event code.
+ *
+ * WSAL stores a template plus placeholders, not a finished string. Rendering is
+ * delegated to WSAL's own classes when the plugin is loaded; if it is not, the
+ * template and the metadata dict are returned as-is. Hand-rolling placeholder
+ * substitution would silently drift from WSAL's own output.
+ */
+function ets_mcp_wsal_alert_info($alert_id) {
+    $info = array('label' => null, 'template' => null, 'rendered' => false);
+    try {
+        if (class_exists('WpSecurityAuditLog')) {
+            $wsal = WpSecurityAuditLog::GetInstance();
+            if (isset($wsal->alerts) && method_exists($wsal->alerts, 'GetAlert')) {
+                $a = $wsal->alerts->GetAlert($alert_id);
+                if ($a) {
+                    $info['label'] = isset($a->desc) ? $a->desc : (isset($a->title) ? $a->title : null);
+                    $info['template'] = isset($a->mesg) ? $a->mesg : null;
+                    $info['rendered'] = true;
+                }
+            }
+        }
+    } catch (\Throwable $e) {
+        // Never let a WSAL internals change break a read.
+        $info['error'] = $e->getMessage();
+    }
+    return $info;
+}
+
+add_action('rest_api_init', function () {
+
+    if (function_exists('get_current_blog_id') && is_multisite()
+        && (int) get_current_blog_id() !== (int) ETS_MCP_BLOG_ID) {
+        return;
+    }
+
+    $can_read = function () {
+        return current_user_can('manage_options');
+    };
+
+    // ---- 6. events -------------------------------------------------------
+    register_rest_route(ETS_MCP_NS, '/activity-log', array(
+        'methods'             => 'GET',
+        'permission_callback' => $can_read,
+        'callback'            => function (WP_REST_Request $req) {
+            global $wpdb;
+            $t = ets_mcp_wsal_tables();
+            if (!ets_mcp_wsal_table_exists($t['occ'])) {
+                return new WP_REST_Response(array(
+                    'ok' => false,
+                    'reason' => 'WSAL occurrences table not found at ' . $t['occ']
+                        . '. On multisite WSAL uses the BASE prefix, not the '
+                        . 'subsite prefix — if this path looks wrong, that is why.',
+                ), 200);
+            }
+
+            $cols = ets_mcp_wsal_columns();
+            $denorm = in_array('username', $cols, true);
+            $blog_id = (int) ETS_MCP_BLOG_ID;
+
+            $where = array();
+            $args = array();
+
+            if (in_array('site_id', $cols, true)) {
+                $where[] = 'site_id = %d';
+                $args[] = $blog_id;
+            }
+
+            $since = ets_mcp_to_ts($req->get_param('since'));
+            if ($since !== null) {
+                $where[] = 'created_on >= %f';
+                $args[] = $since;
+            }
+            $until = ets_mcp_to_ts($req->get_param('until'));
+            if ($until !== null) {
+                $where[] = 'created_on <= %f';
+                $args[] = $until;
+            }
+
+            // Exclusion-based by default. An allowlist would hide the events
+            // nobody thought to anticipate, which are the ones that matter.
+            $excl = $req->get_param('exclude_event_ids');
+            if (is_string($excl)) {
+                $excl = array_filter(array_map('intval', explode(',', $excl)));
+            }
+            if (is_array($excl) && count($excl)) {
+                $where[] = 'alert_id NOT IN (' . implode(',', array_fill(0, count($excl), '%d')) . ')';
+                $args = array_merge($args, array_map('intval', $excl));
+            }
+
+            $only = $req->get_param('event_ids');
+            if (is_string($only)) {
+                $only = array_filter(array_map('intval', explode(',', $only)));
+            }
+            if (is_array($only) && count($only)) {
+                $where[] = 'alert_id IN (' . implode(',', array_fill(0, count($only), '%d')) . ')';
+                $args = array_merge($args, array_map('intval', $only));
+            }
+
+            $username = $req->get_param('username');
+            $username_filtered_in_sql = false;
+            if ($username && $denorm) {
+                $where[] = 'username = %s';
+                $args[] = $username;
+                $username_filtered_in_sql = true;
+            }
+
+            $limit = (int) ($req->get_param('limit') ?: 100);
+            $limit = max(1, min($limit, 500));
+
+            $sql = "SELECT * FROM {$t['occ']}";
+            if ($where) {
+                $sql .= ' WHERE ' . implode(' AND ', $where);
+            }
+            $sql .= ' ORDER BY created_on DESC LIMIT %d';
+            $args[] = $limit;
+
+            $rows = $wpdb->get_results($wpdb->prepare($sql, $args), ARRAY_A);
+            $rows = is_array($rows) ? $rows : array();
+
+            $ids = array_map(function ($r) { return (int) $r['id']; }, $rows);
+            $meta = ets_mcp_wsal_meta_for($ids);
+
+            $events = array();
+            foreach ($rows as $r) {
+                $oid = (int) $r['id'];
+                $m = isset($meta[$oid]) ? $meta[$oid] : array();
+                $alert_id = (int) $r['alert_id'];
+                $info = ets_mcp_wsal_alert_info($alert_id);
+
+                $uname = $denorm && !empty($r['username'])
+                    ? $r['username']
+                    : (isset($m['Username']) ? $m['Username'] : (isset($m['CurrentUserID']) ? $m['CurrentUserID'] : null));
+
+                // Older layouts keep username only in metadata, so SQL could not
+                // filter it. Filter here instead of silently ignoring the arg.
+                if ($username && !$username_filtered_in_sql) {
+                    if (strcasecmp((string) $uname, (string) $username) !== 0) {
+                        continue;
+                    }
+                }
+
+                $ts = isset($r['created_on']) ? (float) $r['created_on'] : null;
+                $events[] = array(
+                    'occurrence_id' => $oid,
+                    'alert_id'      => $alert_id,
+                    'event_label'   => $info['label'],
+                    'message_template' => $info['template'],
+                    'message_rendered_by_wsal' => $info['rendered'],
+                    'severity'      => $denorm && isset($r['severity']) ? $r['severity'] : (isset($m['Severity']) ? $m['Severity'] : null),
+                    'created_on'    => $ts,
+                    'created_on_iso' => $ts ? gmdate('c', (int) $ts) : null,
+                    'username'      => $uname,
+                    'user_roles'    => $denorm && isset($r['user_roles']) ? maybe_unserialize($r['user_roles']) : (isset($m['CurrentUserRoles']) ? $m['CurrentUserRoles'] : null),
+                    'client_ip'     => $denorm && isset($r['client_ip']) ? $r['client_ip'] : (isset($m['ClientIP']) ? $m['ClientIP'] : null),
+                    'object'        => $denorm && isset($r['object']) ? $r['object'] : (isset($m['Object']) ? $m['Object'] : null),
+                    'event_type'    => $denorm && isset($r['event_type']) ? $r['event_type'] : (isset($m['EventType']) ? $m['EventType'] : null),
+                    'site_id'       => isset($r['site_id']) ? (int) $r['site_id'] : null,
+                    'metadata'      => $m,
+                );
+            }
+
+            return new WP_REST_Response(array(
+                'ok'            => true,
+                'schema_layout' => $denorm ? 'denormalized (WSAL 4.x+)' : 'metadata-joined (pre-4.x)',
+                'table'         => $t['occ'],
+                'blog_id'       => $blog_id,
+                'excluded_event_ids' => array_values((array) $excl),
+                'count'         => count($events),
+                'events'        => $events,
+            ), 200);
+        },
+    ));
+
+    // ---- 7. summary ------------------------------------------------------
+    register_rest_route(ETS_MCP_NS, '/activity-log/summary', array(
+        'methods'             => 'GET',
+        'permission_callback' => $can_read,
+        'callback'            => function (WP_REST_Request $req) {
+            global $wpdb;
+            $t = ets_mcp_wsal_tables();
+            if (!ets_mcp_wsal_table_exists($t['occ'])) {
+                return new WP_REST_Response(array(
+                    'ok' => false, 'reason' => 'WSAL occurrences table not found at ' . $t['occ'],
+                ), 200);
+            }
+            $cols = ets_mcp_wsal_columns();
+            $denorm = in_array('username', $cols, true);
+
+            $where = array();
+            $args = array();
+            if (in_array('site_id', $cols, true)) {
+                $where[] = 'site_id = %d';
+                $args[] = (int) ETS_MCP_BLOG_ID;
+            }
+            $since = ets_mcp_to_ts($req->get_param('since'));
+            if ($since !== null) {
+                $where[] = 'created_on >= %f';
+                $args[] = $since;
+            }
+            $username = $req->get_param('username');
+            if ($username && $denorm) {
+                $where[] = 'username = %s';
+                $args[] = $username;
+            }
+
+            $sql = "SELECT alert_id, COUNT(*) AS n, MIN(created_on) AS first_seen, "
+                 . "MAX(created_on) AS last_seen FROM {$t['occ']}";
+            if ($where) {
+                $sql .= ' WHERE ' . implode(' AND ', $where);
+            }
+            $sql .= ' GROUP BY alert_id ORDER BY n DESC';
+
+            $rows = $args
+                ? $wpdb->get_results($wpdb->prepare($sql, $args), ARRAY_A)
+                : $wpdb->get_results($sql, ARRAY_A);
+
+            $out = array();
+            foreach ((array) $rows as $r) {
+                $info = ets_mcp_wsal_alert_info((int) $r['alert_id']);
+                $out[] = array(
+                    'alert_id'    => (int) $r['alert_id'],
+                    'event_label' => $info['label'],
+                    'count'       => (int) $r['n'],
+                    'first_seen_iso' => $r['first_seen'] ? gmdate('c', (int) $r['first_seen']) : null,
+                    'last_seen_iso'  => $r['last_seen'] ? gmdate('c', (int) $r['last_seen']) : null,
+                );
+            }
+            return new WP_REST_Response(array(
+                'ok' => true,
+                'note' => 'Includes ALL event codes, failed logins among them — '
+                        . 'the point of a summary is that high-volume noise '
+                        . 'appears as one number instead of hundreds of rows.',
+                'groups' => $out,
+                'total_events' => array_sum(array_column($out, 'count')),
+            ), 200);
+        },
+    ));
+
+    // ---- 8. retention ----------------------------------------------------
+    register_rest_route(ETS_MCP_NS, '/activity-log/retention', array(
+        'methods'             => 'GET',
+        'permission_callback' => $can_read,
+        'callback'            => function () {
+            global $wpdb;
+            $t = ets_mcp_wsal_tables();
+            $exists = ets_mcp_wsal_table_exists($t['occ']);
+
+            // WSAL settings live in options prefixed wsal_; on multisite they
+            // may be network options. Check both rather than assuming.
+            $get = function ($key) {
+                $v = is_multisite() ? get_site_option($key, null) : null;
+                if ($v === null || $v === false) {
+                    $v = get_option($key, null);
+                }
+                return $v;
+            };
+
+            $settings = array(
+                'pruning_date_enabled'  => $get('wsal_pruning-date-e'),
+                'pruning_date'          => $get('wsal_pruning-date'),
+                'pruning_limit_enabled' => $get('wsal_pruning-limit-e'),
+                'pruning_limit'         => $get('wsal_pruning-limit'),
+            );
+
+            $oldest = $newest = $total = null;
+            if ($exists) {
+                $cols = ets_mcp_wsal_columns();
+                if (in_array('site_id', $cols, true)) {
+                    $row = $wpdb->get_row($wpdb->prepare(
+                        "SELECT MIN(created_on) AS oldest, MAX(created_on) AS newest, COUNT(*) AS n "
+                        . "FROM {$t['occ']} WHERE site_id = %d", (int) ETS_MCP_BLOG_ID
+                    ), ARRAY_A);
+                } else {
+                    $row = $wpdb->get_row(
+                        "SELECT MIN(created_on) AS oldest, MAX(created_on) AS newest, COUNT(*) AS n FROM {$t['occ']}",
+                        ARRAY_A
+                    );
+                }
+                if ($row) {
+                    $oldest = $row['oldest'] ? (float) $row['oldest'] : null;
+                    $newest = $row['newest'] ? (float) $row['newest'] : null;
+                    $total  = (int) $row['n'];
+                }
+            }
+
+            $pruning_on = !empty($settings['pruning_date_enabled'])
+                       || !empty($settings['pruning_limit_enabled']);
+
+            return new WP_REST_Response(array(
+                'ok' => true,
+                'table_exists' => $exists,
+                'settings' => $settings,
+                'pruning_active' => $pruning_on,
+                'oldest_event_iso' => $oldest ? gmdate('c', (int) $oldest) : null,
+                'newest_event_iso' => $newest ? gmdate('c', (int) $newest) : null,
+                'history_days' => ($oldest && $newest)
+                    ? round(($newest - $oldest) / 86400, 1) : null,
+                'total_events' => $total,
+                'warning' => $pruning_on
+                    ? 'PRUNING IS ACTIVE. History is being deleted on a rolling '
+                      . 'basis and anything already pruned is unrecoverable. If '
+                      . 'this log is evidence, widen the retention window now — '
+                      . 'that is more urgent than any tooling built on top of it.'
+                    : null,
+            ), 200);
+        },
+    ));
+});
