@@ -1193,6 +1193,151 @@ async def get_episode_media_meta(id: int) -> dict | str:
 
 
 # ---------------------------------------------------------------------------
+# Content fingerprint — the cheap tripwire
+#
+# Deep revision tooling per post type is the wrong shape for "did anything
+# change". This is one call that counts every content type and reports the
+# newest modification in each, plus a single fingerprint string to diff against
+# the previous run.
+#
+# WHY THIS BEATS ENUMERATING TYPES WE CARE ABOUT
+#   It walks whatever /types returns, so a post type added next month is covered
+#   without anyone remembering to add it — the same reasoning that made the WSAL
+#   filtering exclusion-based. The measured content on this site is episodes
+#   (290), job board (225), pages (66) and testimonials (27); `post`,
+#   `xen_newsletters`, `xen_videos`, `xen_extras` and `mailpoet_email` are all
+#   empty. Hardcoding today's list would go stale silently.
+#
+# COST
+#   One request per type — about nine — each returning a single item, with the
+#   total read from the X-WP-Total header rather than by fetching rows. Cheap
+#   enough to run hourly.
+# ---------------------------------------------------------------------------
+
+# Infrastructure types that churn for reasons unrelated to editorial activity
+# (template parts re-save on theme updates, attachments on any upload) would
+# produce constant false positives.
+_FINGERPRINT_SKIP = {
+    "attachment", "nav_menu_item", "wp_block", "wp_template",
+    "wp_template_part", "wp_global_styles", "wp_navigation",
+    "wp_font_family", "wp_font_face",
+}
+
+_ALL_STATUSES = "publish,draft,pending,private,future,auto-draft,inherit"
+
+
+@mcp.tool(
+    description=(
+        "Cheap change-detection tripwire across ALL content types. Read-only.\n"
+        "\n"
+        "Returns, per post type: total item count, the newest modified "
+        "timestamp, and the id/title of the most recently touched item — plus "
+        "a single `fingerprint` string for the whole site.\n"
+        "\n"
+        "Intended use: store `fingerprint` and compare next run. If it is "
+        "unchanged, nothing anywhere was added, edited or deleted and you can "
+        "stop. If it changed, the per-type rows show you where to look. This "
+        "covers post types nobody thought to monitor, including ones added "
+        "later, which a hardcoded list would miss.\n"
+        "\n"
+        "Counts include drafts and pending items by default, because an "
+        "unpublished draft is exactly the early signal worth catching. Set "
+        "published_only=True to count only live content."
+    ),
+)
+async def get_content_fingerprint(
+    published_only: bool = False,
+    include_empty: bool = False,
+) -> dict | str:
+    import hashlib
+
+    try:
+        r = await client.get("/types", params={"context": "edit"})
+        r.raise_for_status()
+        types = r.json()
+    except Exception as e:
+        return _err("get_content_fingerprint(/types)", e)
+
+    rows: list[dict] = []
+    errors: list[str] = []
+
+    for tname, meta in types.items():
+        if tname in _FINGERPRINT_SKIP:
+            continue
+        rest_base = (meta or {}).get("rest_base")
+        if not rest_base:
+            continue
+
+        params: dict[str, Any] = {
+            "per_page": 1,
+            "context": "edit",
+            "orderby": "modified",
+            "order": "desc",
+        }
+        if not published_only:
+            params["status"] = _ALL_STATUSES
+
+        try:
+            rr = await client.get(f"/{rest_base}", params=params)
+            if rr.status_code >= 400:
+                errors.append(f"{tname}: HTTP {rr.status_code}")
+                continue
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{tname}: {type(e).__name__}")
+            continue
+
+        # Total comes from the header — no need to pull the rows themselves.
+        total = int(rr.headers.get("X-WP-Total", "0") or 0)
+        items = rr.json()
+        newest = items[0] if isinstance(items, list) and items else None
+
+        if total == 0 and not include_empty:
+            continue
+
+        rows.append({
+            "type": tname,
+            "rest_base": rest_base,
+            "count": total,
+            "newest_modified_gmt": (newest or {}).get("modified_gmt"),
+            "newest_id": (newest or {}).get("id"),
+            "newest_status": (newest or {}).get("status"),
+            "newest_title": ((newest or {}).get("title") or {}).get("raw")
+                            or ((newest or {}).get("title") or {}).get("rendered"),
+        })
+
+    rows.sort(key=lambda x: x["type"])
+
+    # Fingerprint deliberately combines count AND newest-modified per type: a
+    # count alone misses an edit to an existing item, and a timestamp alone
+    # misses a deletion (which lowers the count while the newest item is
+    # untouched). Together they catch add, edit and delete.
+    basis = "|".join(
+        f"{r['type']}:{r['count']}:{r['newest_modified_gmt']}" for r in rows
+    )
+    fingerprint = hashlib.sha256(basis.encode()).hexdigest()[:16]
+
+    latest = max(
+        (r["newest_modified_gmt"] for r in rows if r["newest_modified_gmt"]),
+        default=None,
+    )
+
+    return {
+        "ok": True,
+        "fingerprint": fingerprint,
+        "site_newest_modified_gmt": latest,
+        "types_checked": len(rows),
+        "total_items": sum(r["count"] for r in rows),
+        "published_only": published_only,
+        "types": rows,
+        "errors": errors or None,
+        "usage": "Store `fingerprint`. Unchanged next run means nothing was "
+                 "added, edited or deleted anywhere. Changed means compare the "
+                 "per-type rows to find which type moved, then use "
+                 "list_episode_revisions / get_episode_autosave on that item.",
+    }
+
+
+# ---------------------------------------------------------------------------
 # WP Activity Log (WSAL) — read-only
 #
 # WSAL free has no notification rules (Premium only), so the log has to be
