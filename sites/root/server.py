@@ -904,6 +904,249 @@ async def count_users_by_ccap(
     return r.json()
 
 
+# ---------------------------------------------------------------------------
+# ccap-filtered roster export (list_users_by_ccap)
+# ---------------------------------------------------------------------------
+#
+# Replaces the three unreliable roster methods this pipeline used to depend on:
+# the broken Admin Columns Pro CSV export, copy-paste from the wp-admin user
+# list (silently truncates), and list_users domain search (misses members on
+# outside email domains, and overflows the tool response cap).
+#
+# CSV is written TO DISK, never returned inline — a 55-user roster already
+# exceeded the response cap, and a truncated roster that looks complete is the
+# precise failure this tool exists to eliminate.
+
+_EM_DASH = "—"
+
+# Columns the stats workbook wraps in IF(ISNUMBER(...), ..., 0). A blank there
+# silently breaks the Tenure-Weighted columns, so a missing value must render
+# as an em-dash, matching the ACP export it replaces.
+_EM_DASH_FIELDS = ("logins", "member_feed_login")
+
+# (CSV header label, record key) in the exact ACP column order.
+_CSV_COLUMNS = [
+    ("Username", "username"),
+    ("Name", "name"),
+    ("Email", "email"),
+    ("Role", "role"),
+    ("Ccap", "ccap"),
+    ("Registered", "registered"),
+    ("# Of Logins", "logins"),
+    ("Coupon Code", "coupon_code"),
+    ("Member Feed Login", "member_feed_login"),
+    ("Reg. Page ID", "reg_page_id"),
+    ("First Name", "first_name"),
+    ("Last Name", "last_name"),
+    ("Newsletter Optin", "newsletter_optin"),
+    ("S2 EOT", "s2_eot"),
+]
+
+EXPORT_DIR = os.environ.get(
+    "XEN_EXPORT_DIR", os.path.expanduser("~/Downloads/xen-ccap-exports")
+)
+
+
+def _csv_quote(value: Any) -> str:
+    """Quote a field iff it contains a comma, quote, space, or newline.
+
+    Matches the ACP export convention exactly: bare `Username`, quoted
+    `"# Of Logins"`. Python's csv.QUOTE_MINIMAL does NOT quote on spaces,
+    so the quoting is hand-rolled rather than delegated.
+    """
+    s = "" if value is None else str(value)
+    if any(ch in s for ch in (",", '"', " ", "\n", "\r")):
+        return '"' + s.replace('"', '""') + '"'
+    return s
+
+
+def _render_csv(users: list[dict]) -> str:
+    lines = [",".join(_csv_quote(label) for label, _ in _CSV_COLUMNS)]
+    for u in users:
+        cells = []
+        for _, key in _CSV_COLUMNS:
+            val = u.get(key)
+            if val is None and key in _EM_DASH_FIELDS:
+                val = _EM_DASH
+            cells.append(_csv_quote(val))
+        lines.append(",".join(cells))
+    # RFC 4180 line terminator. csv.reader and pandas.read_csv both accept
+    # CRLF and LF identically, so this is not a consumer-visible choice.
+    return "\r\n".join(lines) + "\r\n"
+
+
+async def _fetch_all_ccap_users(params: dict[str, Any]) -> dict:
+    """Page through the endpoint until every matching user is collected.
+
+    Verifies the collected count against the server's own `total` and fails
+    loudly on a mismatch rather than returning a short roster.
+    """
+    page_params = dict(params, per_page=500, page=1)
+    r = await client.get(
+        f"{WP_BASE}/wp-json/xen/v1/users/export-by-ccap", params=page_params
+    )
+    r.raise_for_status()
+    first = r.json()
+
+    users = list(first.get("users") or [])
+    total_pages = int(first.get("total_pages") or 0)
+    for pg in range(2, total_pages + 1):
+        rp = await client.get(
+            f"{WP_BASE}/wp-json/xen/v1/users/export-by-ccap",
+            params=dict(params, per_page=500, page=pg),
+        )
+        rp.raise_for_status()
+        users.extend(rp.json().get("users") or [])
+
+    first["users"] = users
+    total = int(first.get("total") or 0)
+    if len(users) != total:
+        first.setdefault("warnings", []).append(
+            f"INCOMPLETE: collected {len(users)} records but server reported "
+            f"total={total}. Do NOT use this roster."
+        )
+    return first
+
+
+@mcp.tool(
+    description=(
+        "Complete, verifiable roster of xenetwork.org users for a given "
+        "s2Member ccap — the authoritative first step of every group "
+        "subscription renewal. Writes the CSV to disk in the exact 14-column "
+        "Admin Columns Pro schema the stats workbooks consume.\n"
+        "\n"
+        "USE THIS for any 'who is on the X licence' / 'pull the roster for X' "
+        "/ 'how many seats does X have' / renewal-stats question.\n"
+        "\n"
+        "DO NOT use list_users with an email-domain search to build a roster. "
+        "It matches on email domain rather than ccap, so it silently drops "
+        "members on outside domains (St. Lawrence had two Gmail-based members "
+        "it missed), and a 55-user pull overflows the tool response cap.\n"
+        "\n"
+        "DO NOT use count_users_by_ccap to size a licence. That tool reads "
+        "only the root wp_capabilities blob, and s2Member STRIPS the ccap from "
+        "that blob when it demotes a user at EOT — so it under-reports every "
+        "org with expired members (returns 121 for `uva` where the roster is "
+        "~414, and 0 for `dartdemo`). This tool reads the `ccaps` usermeta key "
+        "and the subsite capability blobs, both of which survive demotion.\n"
+        "\n"
+        "CCAP FAMILIES: an organisation's licence usually spans more than one "
+        "ccap — Dartmouth is `dartmouth` (active) plus `dartdemo` (demoted "
+        "trial accounts), and both count toward cumulative usage. Pass a list "
+        "or use ccap_prefix; matching one exact ccap reintroduces the "
+        "incompleteness bug in a new form.\n"
+        "\n"
+        "Args:\n"
+        "  ccap: required unless ccap_prefix. Slug, or comma-separated list "
+        "('dartmouth,dartdemo').\n"
+        "  ccap_prefix: prefix match — 'dart' catches dartmouth + dartdemo.\n"
+        "  include_demoted: default True. Demoted accounts belong to the "
+        "licence; excluding them understates cumulative usage.\n"
+        "  format: 'csv' (default — writes the complete roster to disk and "
+        "returns the path plus counts), 'counts' (verification numbers only, "
+        "no records, fastest), or 'json' (paginated records inline).\n"
+        "  page / per_page: json format only (default 200/page).\n"
+        "  since / until: optional registered_date bounds (YYYY-MM-DD), for "
+        "'seats active during the licence year' figures.\n"
+        "  save_to: override the output path for csv format.\n"
+        "\n"
+        "ALWAYS CHECK before trusting the roster: `total` and "
+        "`counts_by_role` are the completeness proof — compare them against "
+        "the expected seat count, and read `warnings` and `verification`. A "
+        "non-empty `warnings` means the roster may be short."
+    ),
+)
+async def list_users_by_ccap(
+    ccap: str | None = None,
+    ccap_prefix: str | None = None,
+    include_demoted: bool = True,
+    format: str = "csv",
+    page: int = 1,
+    per_page: int = 200,
+    since: str | None = None,
+    until: str | None = None,
+    save_to: str | None = None,
+) -> dict | str:
+    if not ccap and not ccap_prefix:
+        return "ERROR: provide ccap and/or ccap_prefix"
+    if format not in ("csv", "json", "counts"):
+        return f"ERROR: format must be 'csv', 'json', or 'counts' — got {format!r}"
+
+    params: dict[str, Any] = {
+        "include_demoted": "true" if include_demoted else "false",
+    }
+    if ccap:
+        params["ccap"] = ccap
+    if ccap_prefix:
+        params["ccap_prefix"] = ccap_prefix
+    if since:
+        params["since"] = since
+    if until:
+        params["until"] = until
+
+    try:
+        if format == "counts":
+            r = await client.get(
+                f"{WP_BASE}/wp-json/xen/v1/users/export-by-ccap",
+                params=dict(params, per_page=0),
+            )
+            r.raise_for_status()
+            return r.json()
+
+        if format == "json":
+            r = await client.get(
+                f"{WP_BASE}/wp-json/xen/v1/users/export-by-ccap",
+                params=dict(params, per_page=min(per_page, 500), page=page),
+            )
+            r.raise_for_status()
+            return r.json()
+
+        payload = await _fetch_all_ccap_users(params)
+    except Exception as e:
+        return _err("list_users_by_ccap", e)
+
+    users = payload.get("users") or []
+    csv_text = _render_csv(users)
+
+    if save_to:
+        path = os.path.expanduser(save_to)
+    else:
+        slug = (ccap or ccap_prefix or "ccap").replace(",", "-").replace(" ", "")
+        stamp = payload.get("snapshot_date") or "export"
+        os.makedirs(EXPORT_DIR, exist_ok=True)
+        path = os.path.join(EXPORT_DIR, f"{slug}-users-export-{stamp}.csv")
+
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(csv_text)
+    except Exception as e:
+        return _err("list_users_by_ccap (write csv)", e)
+
+    preview = csv_text.split("\r\n")[: min(4, len(users) + 1)]
+    return {
+        "csv_path": path,
+        "rows_written": len(users),
+        "bytes": len(csv_text.encode("utf-8")),
+        "header": ",".join(_csv_quote(label) for label, _ in _CSV_COLUMNS),
+        "preview": preview,
+        "total": payload.get("total"),
+        "counts_by_role": payload.get("counts_by_role"),
+        "counts_by_ccap": payload.get("counts_by_ccap"),
+        "verification": payload.get("verification"),
+        "warnings": payload.get("warnings") or [],
+        "snapshot_date": payload.get("snapshot_date"),
+        "generated_at": payload.get("generated_at"),
+        "note": (
+            "Encoding UTF-8 (no BOM); consumers should read with "
+            "encoding='utf-8-sig' to tolerate either. Missing values in "
+            "'# Of Logins' and 'Member Feed Login' render as an em-dash to "
+            "match the ACP export. Check `total` and `counts_by_role` against "
+            "the expected seat count before using this roster."
+        ),
+    }
+
+
 if __name__ == "__main__":
     print(
         f"[wp-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",

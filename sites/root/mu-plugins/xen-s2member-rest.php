@@ -594,3 +594,443 @@ add_action('rest_api_init', function () {
     ]);
 });
 
+// ===========================================================================
+// Append to xen-s2member-rest.php — ccap-filtered roster export
+// ===========================================================================
+//
+// GET /wp-json/xen/v1/users/export-by-ccap
+//
+// Returns the COMPLETE user record set for a ccap (or ccap family) in the
+// 14-column Admin Columns Pro export schema, plus verification counts.
+//
+// WHY THIS DOES NOT MATCH ON wp_capabilities ALONE
+// ---------------------------------------------------------------------------
+// s2Member STRIPS the ccap out of the root `wp_capabilities` blob when it
+// demotes a user at EOT. Verified against live data 2026-07-30:
+//
+//   active  uva (id 12439): wp_capabilities = {s2member_level4,
+//                                              access_s2member_ccap_uva}
+//   demoted uva (id  3851): wp_capabilities = {demoted}       <-- ccap GONE
+//
+// So the sibling /users/by-ccap endpoint, which matches only that blob,
+// silently under-reports every organisation with expired members. Measured
+// on this install: it returns 121 for `uva` where the real roster is ~414,
+// and returns ZERO for `dartdemo` because all of those accounts are demoted.
+// That is the exact silent-incompleteness failure this endpoint exists to end.
+//
+// Two things DO survive demotion, and both are used here:
+//
+//   1. the flat `ccaps` usermeta key  (value: "uva")            <-- primary
+//   2. the SUBSITE capability blobs (wp_2_capabilities, wp_3_…, wp_4_…),
+//      which keep access_s2member_ccap_<slug> post-demotion     <-- secondary
+//
+// The endpoint returns the UNION of both, tags each user with the sources
+// that matched, and reports any disagreement between the sources explicitly
+// in `verification`. A discrepancy must be loud, never quietly resolved.
+//
+// Read-only. SELECT only, every query through $wpdb->prepare().
+
+/**
+ * Normalise a ccap argument into a list of lowercase slugs.
+ * Accepts "a,b", "a b", ["a","b"], or "a".
+ */
+function xen_ccap_export_normalize_list($raw) {
+    if (is_string($raw)) {
+        $raw = preg_split('/[\s,|]+/', $raw);
+    }
+    if (!is_array($raw)) {
+        return [];
+    }
+    $out = [];
+    foreach ($raw as $v) {
+        $v = strtolower(trim((string) $v));
+        if ($v !== '') {
+            $out[$v] = true;
+        }
+    }
+    return array_keys($out);
+}
+
+/** Exact-slug match against the wanted list, or prefix match. */
+function xen_ccap_export_match($ccap, array $wanted, $prefix) {
+    $c = strtolower(trim((string) $ccap));
+    if ($c === '') {
+        return false;
+    }
+    if (in_array($c, $wanted, true)) {
+        return true;
+    }
+    if ($prefix !== '' && strpos($c, $prefix) === 0) {
+        return true;
+    }
+    return false;
+}
+
+function xen_users_export_by_ccap($request) {
+    global $wpdb;
+
+    $wanted   = xen_ccap_export_normalize_list($request->get_param('ccap'));
+    $prefix   = strtolower(trim((string) $request->get_param('ccap_prefix')));
+    $per_page = (int) $request->get_param('per_page');
+    $page     = max(1, (int) $request->get_param('page'));
+    $max_scan = max(1, min(200000, (int) $request->get_param('max_scan')));
+    $since    = trim((string) $request->get_param('since'));
+    $until    = trim((string) $request->get_param('until'));
+    $include_demoted = filter_var(
+        $request->get_param('include_demoted'), FILTER_VALIDATE_BOOLEAN
+    );
+    $include_no_site_role = filter_var(
+        $request->get_param('include_no_site_role'), FILTER_VALIDATE_BOOLEAN
+    );
+    // Optional role-slug allowlist, applied AFTER the ccap match so the
+    // verification counts still describe the whole cohort.
+    $role_filter = xen_ccap_export_normalize_list($request->get_param('role'));
+
+    if (empty($wanted) && $prefix === '') {
+        return new WP_Error(
+            'bad_request',
+            'Provide ccap (string or array) and/or ccap_prefix.',
+            ['status' => 400]
+        );
+    }
+
+    // A date-only `until` must cover the whole day, otherwise a same-day
+    // registration sorts after it and is silently dropped.
+    if ($until !== '' && strlen($until) === 10) {
+        $until .= ' 23:59:59';
+    }
+
+    // Coarse SQL prefilter needles. Every hit is re-verified in PHP below,
+    // so a needle that is too broad costs time, never correctness.
+    $needles = $wanted;
+    if ($prefix !== '') {
+        $needles[] = $prefix;
+    }
+
+    $cap_prefix = 'access_s2member_ccap_';
+    // s2Member writes its per-user keys on the BASE prefix even on multisite
+    // (observed: wp_s2member_login_counter, never wp_2_s2member_login_counter).
+    $p = $wpdb->base_prefix;
+
+    // --- source 1: the flat `ccaps` usermeta key (survives demotion) --------
+    $src_ccaps = [];
+    $where1  = [];
+    $params1 = ['ccaps'];
+    foreach ($needles as $n) {
+        $where1[]  = 'meta_value LIKE %s';
+        $params1[] = '%' . $wpdb->esc_like($n) . '%';
+    }
+    $params1[] = $max_scan;
+    $rows1 = $wpdb->get_results($wpdb->prepare(
+        "SELECT user_id, meta_value FROM {$wpdb->usermeta}
+         WHERE meta_key = %s AND (" . implode(' OR ', $where1) . ")
+         LIMIT %d",
+        $params1
+    ));
+    foreach ($rows1 as $row) {
+        foreach (preg_split('/[\s,|]+/', (string) $row->meta_value) as $c) {
+            if (xen_ccap_export_match($c, $wanted, $prefix)) {
+                $src_ccaps[(int) $row->user_id][strtolower(trim($c))] = true;
+            }
+        }
+    }
+
+    // --- source 2: capability blobs, root + every subsite ------------------
+    $src_caps = [];
+    $where2  = [];
+    $params2 = [$wpdb->esc_like($p) . '%capabilities'];
+    foreach ($needles as $n) {
+        $where2[]  = 'meta_value LIKE %s';
+        $params2[] = '%' . $wpdb->esc_like($cap_prefix . $n) . '%';
+    }
+    $params2[] = $max_scan;
+    $rows2 = $wpdb->get_results($wpdb->prepare(
+        "SELECT user_id, meta_value FROM {$wpdb->usermeta}
+         WHERE meta_key LIKE %s AND (" . implode(' OR ', $where2) . ")
+         LIMIT %d",
+        $params2
+    ));
+    foreach ($rows2 as $row) {
+        $caps = maybe_unserialize($row->meta_value);
+        if (!is_array($caps)) {
+            continue;
+        }
+        foreach ($caps as $cap_key => $granted) {
+            if (!$granted || strpos((string) $cap_key, $cap_prefix) !== 0) {
+                continue;
+            }
+            $c = substr((string) $cap_key, strlen($cap_prefix));
+            if (xen_ccap_export_match($c, $wanted, $prefix)) {
+                $src_caps[(int) $row->user_id][strtolower($c)] = true;
+            }
+        }
+    }
+
+    $all_ids = array_values(array_unique(array_merge(
+        array_keys($src_ccaps), array_keys($src_caps)
+    )));
+    sort($all_ids, SORT_NUMERIC);
+
+    // Two queries total for the whole roster: one for wp_users rows, one for
+    // every usermeta row. get_userdata()/get_user_meta() below hit cache.
+    if (!empty($all_ids)) {
+        cache_users($all_ids);
+        update_meta_cache('user', $all_ids);
+    }
+
+    $role_names = wp_roles()->get_names();
+
+    $records         = [];
+    $counts_by_role  = [];
+    $counts_by_ccap  = [];
+    $role_slugs_seen = [];
+    $excluded_demoted = 0;
+    $excluded_by_date = 0;
+    $excluded_no_site_role = 0;
+    $excluded_by_role = 0;
+    $no_site_role_ids = [];
+
+    foreach ($all_ids as $uid) {
+        $u = get_userdata($uid);
+        if (!$u) {
+            continue;
+        }
+
+        $role_slug  = !empty($u->roles) ? (string) reset($u->roles) : '';
+        $role_label = ($role_slug !== '' && isset($role_names[$role_slug]))
+            ? translate_user_role($role_names[$role_slug])
+            : $role_slug;
+
+        // No role on THIS blog means not a member of this site. Verified
+        // 2026-07-30: GET /wp/v2/users/2328 returns 404 for one of these, so
+        // WordPress itself does not consider them users here. They are
+        // orphaned subsite capability rows (wp_2_/wp_3_/wp_4_capabilities)
+        // left behind when the account was removed from the root blog — all
+        // 2019-2022 vintage, with no login counter, no feed access and no
+        // `ccaps` meta. Counting them inflated UVA from 414 to 471.
+        //
+        // Excluded by default, but COUNTED and sampled in `verification` so
+        // the residue stays visible. Silently dropping them would be the same
+        // class of bug as silently including them.
+        if ($role_slug === '') {
+            $excluded_no_site_role++;
+            if (count($no_site_role_ids) < 25) {
+                $no_site_role_ids[] = (int) $uid;
+            }
+            if (!$include_no_site_role) {
+                continue;
+            }
+        }
+
+        if (!$include_demoted && $role_slug === 'demoted') {
+            $excluded_demoted++;
+            continue;
+        }
+
+        if (!empty($role_filter) && !in_array($role_slug, $role_filter, true)) {
+            $excluded_by_role++;
+            continue;
+        }
+
+        $registered = $u->user_registered; // 'Y-m-d H:i:s', UTC
+        if (($since !== '' && $registered < $since)
+            || ($until !== '' && $registered > $until)) {
+            $excluded_by_date++;
+            continue;
+        }
+
+        $meta = function ($key) use ($uid) {
+            $v = get_user_meta($uid, $key, true);
+            return ($v === '' || $v === null || $v === false) ? null : $v;
+        };
+
+        $ccaps_matched = array_keys(
+            ($src_ccaps[$uid] ?? []) + ($src_caps[$uid] ?? [])
+        );
+        sort($ccaps_matched);
+
+        $sources = [];
+        if (isset($src_ccaps[$uid])) { $sources[] = 'ccaps_meta'; }
+        if (isset($src_caps[$uid]))  { $sources[] = 'capabilities'; }
+
+        $coupons = $meta($p . 's2member_coupon_codes');
+        if (is_array($coupons)) {
+            $coupons = implode(';', array_filter(
+                array_map('strval', $coupons), 'strlen'
+            ));
+            if ($coupons === '') {
+                $coupons = null;
+            }
+        }
+
+        $logins = $meta($p . 's2member_login_counter');
+        // NOTE: `member_feed_access_qty` is the ONLY storage key for the
+        // "Member Feed Login" column. The MCP's s2_custom_member_feed_qty
+        // field is an alias of this same key, so the two can never disagree.
+        $feed   = $meta('member_feed_access_qty');
+        $eot    = $meta($p . 's2member_auto_eot_time');
+
+        $records[] = [
+            'user_id'           => (int) $uid,
+            'username'          => $u->user_login,
+            'name'              => $u->display_name,
+            'email'             => $u->user_email,
+            'role'              => $role_label,
+            'role_slug'         => $role_slug,
+            'ccap'              => implode(';', $ccaps_matched),
+            'registered'        => $registered,
+            'logins'            => ($logins === null) ? null : (int) $logins,
+            'coupon_code'       => $coupons,
+            'member_feed_login' => ($feed === null) ? null : (int) $feed,
+            'reg_page_id'       => $meta('reg_page_id'),
+            'first_name'        => $meta('first_name'),
+            'last_name'         => $meta('last_name'),
+            'newsletter_optin'  => $meta('newsletter_optin'),
+            's2_eot'            => $eot,
+            's2_eot_iso'        => $eot ? gmdate('c', (int) $eot) : null,
+            'all_ccaps'         => $meta('ccaps'),
+            'ccap_sources'      => $sources,
+        ];
+
+        $counts_by_role[$role_label]  = ($counts_by_role[$role_label] ?? 0) + 1;
+        $role_slugs_seen[$role_slug]  = $role_label;
+        foreach ($ccaps_matched as $c) {
+            $counts_by_ccap[$c] = ($counts_by_ccap[$c] ?? 0) + 1;
+        }
+    }
+
+    $total = count($records);
+    if ($per_page <= 0) {
+        // per_page=0 is the cheap "counts only" mode — the fast completeness
+        // check without paying for the record payload.
+        $page_records = [];
+        $total_pages  = 0;
+    } else {
+        $total_pages  = (int) ceil($total / $per_page);
+        $page_records = array_slice($records, ($page - 1) * $per_page, $per_page);
+    }
+
+    // A truncated scan yields a roster that looks complete and is not. Say so.
+    $warnings = [];
+    if (count($rows1) >= $max_scan) {
+        $warnings[] = "ccaps-meta scan hit max_scan ({$max_scan}) — RESULTS MAY BE INCOMPLETE. Raise max_scan and re-run.";
+    }
+    if (count($rows2) >= $max_scan) {
+        $warnings[] = "capabilities scan hit max_scan ({$max_scan}) — RESULTS MAY BE INCOMPLETE. Raise max_scan and re-run.";
+    }
+
+    arsort($counts_by_ccap);
+
+    return [
+        'users'          => $page_records,
+        'total'          => $total,
+        'total_pages'    => $total_pages,
+        'page'           => $page,
+        'per_page'       => $per_page,
+        'counts_by_role' => (object) $counts_by_role,
+        'counts_by_ccap' => (object) $counts_by_ccap,
+        'query' => [
+            'ccap'                 => $wanted,
+            'ccap_prefix'          => $prefix,
+            'include_demoted'      => $include_demoted,
+            'include_no_site_role' => $include_no_site_role,
+            'role'                 => $role_filter,
+            'since'           => $since ?: null,
+            'until'           => $until ?: null,
+            'max_scan'        => $max_scan,
+        ],
+        // Cross-source agreement. `only_in_*` should normally be empty for
+        // active-only cohorts and non-empty only where s2Member stripped the
+        // capability on demotion. Anything unexpected here means investigate
+        // before trusting the roster.
+        'verification' => [
+            'matched_by_ccaps_meta'   => count($src_ccaps),
+            'matched_by_capabilities' => count($src_caps),
+            'union_before_filters'    => count($all_ids),
+            'only_in_ccaps_meta'      => array_values(array_diff(
+                array_keys($src_ccaps), array_keys($src_caps)
+            )),
+            'only_in_capabilities'    => array_values(array_diff(
+                array_keys($src_caps), array_keys($src_ccaps)
+            )),
+            'excluded_demoted'        => $excluded_demoted,
+            'excluded_by_date'        => $excluded_by_date,
+            // Ccap residue on accounts that are no longer users of this site.
+            // Expected to be non-zero on long-running licences; a sudden jump
+            // is worth a look before trusting the roster.
+            'excluded_no_site_role'   => $excluded_no_site_role,
+            'no_site_role_sample_ids' => $no_site_role_ids,
+            'excluded_by_role'        => $excluded_by_role,
+            'rows_scanned_ccaps_meta' => count($rows1),
+            'rows_scanned_caps'       => count($rows2),
+        ],
+        'role_slugs_seen' => (object) $role_slugs_seen,
+        'warnings'        => $warnings,
+        'snapshot_date'   => current_time('Y-m-d'),
+        'generated_at'    => current_time('c'),
+        'site'            => home_url(),
+    ];
+}
+
+add_action('rest_api_init', function () {
+    register_rest_route('xen/v1', '/users/export-by-ccap', [
+        'methods'             => 'GET',
+        'permission_callback' => function () { return current_user_can('list_users'); },
+        'args' => [
+            'ccap' => [
+                'required'    => false,
+                'description' => 'CCAP slug, comma-separated list, or array. e.g. "cmu" or "dartmouth,dartdemo".',
+            ],
+            'ccap_prefix' => [
+                'default'           => '',
+                'type'              => 'string',
+                'description'       => 'Prefix match, e.g. "dart" matches dartmouth + dartdemo.',
+                'sanitize_callback' => 'sanitize_text_field',
+            ],
+            'include_demoted' => [
+                'default'     => true,
+                'type'        => 'boolean',
+                'description' => 'Include accounts demoted at EOT. Default true — they belong to the licence and count toward cumulative usage.',
+            ],
+            'include_no_site_role' => [
+                'default'     => false,
+                'type'        => 'boolean',
+                'description' => 'Include ccap residue on accounts that are no longer users of this site (no role on the root blog). Default false — these are orphaned subsite capability rows, not members. Counted either way in verification.excluded_no_site_role.',
+            ],
+            'role' => [
+                'default'           => '',
+                'type'              => 'string',
+                'description'       => 'Optional role-slug filter, comma-separated. e.g. "s2member_level4" for active only, or "demoted". Applied after the ccap match.',
+                'sanitize_callback' => 'sanitize_text_field',
+            ],
+            'per_page' => [
+                'default'     => 200,
+                'type'        => 'integer',
+                'description' => 'Records per page. 0 returns counts only (fast completeness check).',
+            ],
+            'page' => [
+                'default' => 1,
+                'type'    => 'integer',
+            ],
+            'max_scan' => [
+                'default'     => 20000,
+                'type'        => 'integer',
+                'description' => 'Row cap on each prefilter scan. Hitting it emits a loud warning rather than silently truncating.',
+            ],
+            'since' => [
+                'default'           => '',
+                'type'              => 'string',
+                'description'       => 'Only users registered on/after this date (YYYY-MM-DD).',
+                'sanitize_callback' => 'sanitize_text_field',
+            ],
+            'until' => [
+                'default'           => '',
+                'type'              => 'string',
+                'description'       => 'Only users registered on/before this date (YYYY-MM-DD).',
+                'sanitize_callback' => 'sanitize_text_field',
+            ],
+        ],
+        'callback' => 'xen_users_export_by_ccap',
+    ]);
+});
+
