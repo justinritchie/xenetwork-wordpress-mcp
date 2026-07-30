@@ -1147,6 +1147,180 @@ async def list_users_by_ccap(
     }
 
 
+# ---------------------------------------------------------------------------
+# Member access writes — role + Auto-EOT (set_member_access)
+# ---------------------------------------------------------------------------
+#
+# The only user-write surface on this server. Closes the last manual step in
+# the group cancellation flow: demote members L4 -> L2 (which suppresses the
+# "EOT Reminder L4" mail that would otherwise go to a cancelled group) and set
+# Auto-EOT to the paid-through date so access lapses on schedule.
+#
+# The one thing that must not regress: a demotion performed here MUST leave the
+# member visible to list_users_by_ccap. s2Member's own demotion strips the ccap
+# from the root capability blob, which is why count_users_by_ccap under-reports
+# every org with expired members. This endpoint preserves ccaps in every blob.
+
+
+async def _set_access_call(payload: dict[str, Any]) -> dict | str:
+    try:
+        r = await client.post(
+            f"{WP_BASE}/wp-json/xen/v1/users/set-access", json=payload
+        )
+    except Exception as e:
+        return _err("set_member_access", e)
+    try:
+        data = r.json()
+    except Exception:
+        return f"ERROR: HTTP {r.status_code}, non-JSON body: {r.text[:300]}"
+    if isinstance(data, dict):
+        # Hoist anything that must not be skimmed past.
+        if data.get("warnings"):
+            data["ATTENTION"] = data["warnings"]
+        bad = [
+            u for u in (data.get("users") or [])
+            if u.get("status") in ("write_unconfirmed", "not_found", "ambiguous")
+        ]
+        if bad:
+            data["NEEDS_REVIEW"] = bad
+    return data
+
+
+@mcp.tool(
+    description=(
+        "Set a member's s2Member level/role and/or Auto-EOT date on "
+        "xenetwork.org. Dry-run by default — pass dry_run=False to write.\n"
+        "\n"
+        "USE FOR group cancellations and seat removals: demoting members from "
+        "Level 4 to Level 2 (which suppresses the 'EOT Reminder L4' email that "
+        "would otherwise go to a cancelled group) and setting Auto-EOT to the "
+        "paid-through date so access lapses on schedule rather than being cut "
+        "early or left open.\n"
+        "\n"
+        "CCAP SAFETY: a demotion through this tool does NOT strip the member's "
+        "ccap. s2Member's own EOT demotion removes access_s2member_ccap_<slug> "
+        "from the root capability blob — which is why count_users_by_ccap "
+        "under-reports every org with expired members. This preserves ccaps in "
+        "every blob, so the member still appears in list_users_by_ccap "
+        "afterwards. Verify that with a roster pull after any demotion.\n"
+        "\n"
+        "Args:\n"
+        "  user: ID, email, login, or slug. Exactly one identifier.\n"
+        "  level: 0-5, a role slug ('s2member_level2'), or 'demoted'. Must be "
+        "a REGISTERED role — unknown slugs are refused, not invented.\n"
+        "  auto_eot: 'YYYY-MM-DD' (midnight UTC), unix seconds, or 'clear'. "
+        "The response reports which interpretation was used.\n"
+        "  reason: REQUIRED free text. Written to the s2Member notes field and "
+        "an audit key so a demotion traces back to its cancellation.\n"
+        "  preserve_ccaps: default True. Leave it True.\n"
+        "  dry_run: default True. Reads current values and reports the exact "
+        "delta without writing.\n"
+        "\n"
+        "Returns per user: old_level, new_level, old_auto_eot, new_auto_eot, "
+        "ccaps_before, ccaps_after, status. Status is would_change / "
+        "already_set / applied / write_unconfirmed / not_found. A write counts "
+        "as `applied` ONLY if reading the record back confirms it; a silently "
+        "discarded write surfaces as write_unconfirmed."
+    ),
+    annotations={"destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def set_member_access(
+    user: str,
+    reason: str,
+    level: str | None = None,
+    auto_eot: str | None = None,
+    preserve_ccaps: bool = True,
+    dry_run: bool = True,
+) -> dict | str:
+    if not reason or not reason.strip():
+        return "ERROR: `reason` is required — it is the audit trail."
+    if level is None and auto_eot is None:
+        return "ERROR: supply at least one of level or auto_eot."
+    payload: dict[str, Any] = {
+        "user": user,
+        "reason": reason,
+        "preserve_ccaps": bool(preserve_ccaps),
+        "dry_run": bool(dry_run),
+    }
+    if level is not None:
+        payload["level"] = level
+    if auto_eot is not None:
+        payload["auto_eot"] = auto_eot
+    return await _set_access_call(payload)
+
+
+@mcp.tool(
+    description=(
+        "Set level and/or Auto-EOT for MULTIPLE members on xenetwork.org in "
+        "one batch. Dry-run by default — pass dry_run=False to write.\n"
+        "\n"
+        "The cancellation primitive: demote a whole group to Level 2 and set "
+        "everyone's Auto-EOT to the paid-through date in a single verified "
+        "operation, while leaving any member who is being migrated to an "
+        "individual membership untouched.\n"
+        "\n"
+        "SAFETY: every identifier is resolved and every value validated BEFORE "
+        "anything is written. Any unresolvable user, unknown role slug, or "
+        "malformed date aborts the ENTIRE batch with nothing written, unless "
+        "allow_partial=True. A batch larger than max_batch is refused outright "
+        "rather than truncated — a silently half-applied cancellation is the "
+        "failure this is built to prevent.\n"
+        "\n"
+        "CCAP SAFETY: demotions here preserve ccaps, so members stay visible "
+        "to list_users_by_ccap. Confirm with a roster pull afterwards.\n"
+        "\n"
+        "Args:\n"
+        "  users: list of identifiers (ID/email/login), or list of objects "
+        "{identifier, level?, auto_eot?} for per-user overrides. Accepts a "
+        "JSON string too.\n"
+        "  level / auto_eot: batch defaults, overridden per user.\n"
+        "  reason: REQUIRED. Written to each member's audit trail.\n"
+        "  dry_run: default True.\n"
+        "  allow_partial: default False. Leave it False for cancellations.\n"
+        "  max_batch: default 100. Oversized batches are refused.\n"
+        "\n"
+        "Returns a per-user table plus a `summary` count by status. Check "
+        "`summary` and any ATTENTION / NEEDS_REVIEW keys before considering "
+        "the run done."
+    ),
+    annotations={"destructiveHint": True, "idempotentHint": True, "openWorldHint": True},
+)
+async def bulk_set_member_access(
+    users: Any,
+    reason: str,
+    level: str | None = None,
+    auto_eot: str | None = None,
+    preserve_ccaps: bool = True,
+    dry_run: bool = True,
+    allow_partial: bool = False,
+    max_batch: int = 100,
+) -> dict | str:
+    if not reason or not reason.strip():
+        return "ERROR: `reason` is required — it is the audit trail."
+    if isinstance(users, str):
+        try:
+            users = json.loads(users)
+        except Exception:
+            users = [u.strip() for u in users.split(",") if u.strip()]
+    if not isinstance(users, list) or not users:
+        return "ERROR: `users` must be a non-empty list."
+    norm = [u if isinstance(u, dict) else {"identifier": u} for u in users]
+
+    payload: dict[str, Any] = {
+        "users": norm,
+        "reason": reason,
+        "preserve_ccaps": bool(preserve_ccaps),
+        "dry_run": bool(dry_run),
+        "allow_partial": bool(allow_partial),
+        "max_batch": int(max_batch),
+    }
+    if level is not None:
+        payload["level"] = level
+    if auto_eot is not None:
+        payload["auto_eot"] = auto_eot
+    return await _set_access_call(payload)
+
+
 if __name__ == "__main__":
     print(
         f"[wp-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",

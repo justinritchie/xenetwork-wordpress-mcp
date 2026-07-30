@@ -1034,3 +1034,444 @@ add_action('rest_api_init', function () {
     ]);
 });
 
+// ===========================================================================
+// POST /xen/v1/users/set-access — role + Auto-EOT writes
+// ===========================================================================
+//
+// The ONLY user-write endpoint here. Everything else in this file is read-only.
+// Two fields move: the membership role, and wp_s2member_auto_eot_time. Nothing
+// else is writable, by construction — see XEN_SET_ACCESS_WRITABLE below.
+//
+// WHY THIS MUST NOT USE WP_User::set_role()
+// ---------------------------------------------------------------------------
+// set_role() REPLACES the whole capabilities array, which drops every
+// access_s2member_ccap_<slug> entry with it. That is precisely the data loss
+// s2Member itself inflicts on demotion at EOT, and the reason
+// count_users_by_ccap reports 121 for `uva` against a real roster of 414.
+// Reproducing it here would make demoted members vanish from their own roster.
+//
+// So a role change reads the existing blob, swaps ONLY the role key, and puts
+// the ccap capabilities back. The flat `ccaps` usermeta key is never touched.
+//
+// WHY DIRECT META WRITES RATHER THAN THE ROLE API
+// ---------------------------------------------------------------------------
+// Two reasons. First, set_user_role fires hooks that s2Member listens on, and
+// the entire point of the L4-to-L2 demotion is to SUPPRESS the "EOT Reminder
+// L4" email — firing membership hooks risks sending the very mail we are
+// trying to stop. Second, the role has to land on the subsite blobs too (see
+// below), which the single-blog role API will not do. Caches are cleaned
+// explicitly afterwards instead.
+//
+// WHICH BLOBS GET WRITTEN — the ticket's open question, answered from data
+// ---------------------------------------------------------------------------
+// All of them: the root blob and every wp_N_capabilities blob that already
+// exists for that user. Verified against a real s2Member demotion (UVA user
+// 3851), where s2Member set `demoted` on the root AND on wp_2_, wp_3_ and
+// wp_4_capabilities. Writing the root alone would demote a member on the
+// network root while leaving them at Level 4 on the ETS subsite — access
+// removed in one place and live in another, which is worse than not acting.
+//
+// Note the asymmetry in s2Member's own behaviour: on that user the ccap
+// SURVIVED on the subsite blobs and was stripped only from the root. This
+// endpoint preserves it everywhere.
+
+// Hard allowlist. This endpoint must not become a general usermeta writer.
+function xen_set_access_writable_keys() {
+    global $wpdb;
+    return [
+        $wpdb->base_prefix . 's2member_auto_eot_time',
+        $wpdb->base_prefix . 's2member_notes',
+        $wpdb->base_prefix . 's2member_access_cap_times',
+        'xen_mcp_access_audit',
+    ];
+}
+
+function xen_set_access_resolve_user($ident) {
+    $ident = trim((string) $ident);
+    if ($ident === '') {
+        return null;
+    }
+    if (ctype_digit($ident)) {
+        $u = get_user_by('id', (int) $ident);
+        if ($u) return $u;
+    }
+    if (is_email($ident)) {
+        $u = get_user_by('email', $ident);
+        if ($u) return $u;
+    }
+    return get_user_by('login', $ident) ?: get_user_by('slug', $ident) ?: null;
+}
+
+// Accepts 0-5, 's2member_level2', or any registered role slug such as
+// 'demoted'. Returns the role slug, or null if it is not a REGISTERED role —
+// inventing a pseudo-role would produce a user with no working capabilities.
+function xen_set_access_normalize_role($level) {
+    if ($level === null || $level === '') {
+        return null;
+    }
+    $raw = strtolower(trim((string) $level));
+    if (ctype_digit($raw) && (int) $raw >= 0 && (int) $raw <= 5) {
+        $raw = 's2member_level' . (int) $raw;
+    }
+    $names = wp_roles()->get_names();
+    return isset($names[$raw]) ? $raw : null;
+}
+
+// 'clear' empties the field. A bare YYYY-MM-DD becomes midnight UTC that day;
+// a unix integer is used verbatim. Those are NOT the same instant, and the
+// difference is real access time, so the caller is told which was applied.
+function xen_set_access_normalize_eot($eot, &$how) {
+    $how = null;
+    if ($eot === null || $eot === '') {
+        return ['skip' => true];
+    }
+    $raw = trim((string) $eot);
+    if (strtolower($raw) === 'clear') {
+        $how = 'clear';
+        return ['value' => '', 'clear' => true];
+    }
+    if (ctype_digit($raw)) {
+        $how = 'unix';
+        return ['value' => (string) (int) $raw];
+    }
+    if (preg_match('~^\d{4}-\d{2}-\d{2}$~', $raw)) {
+        $ts = strtotime($raw . ' 00:00:00 UTC');
+        if ($ts === false) {
+            return ['error' => "unparseable date: {$raw}"];
+        }
+        $how = 'date_midnight_utc';
+        return ['value' => (string) $ts];
+    }
+    $ts = strtotime($raw . ' UTC');
+    if ($ts === false) {
+        return ['error' => "unparseable auto_eot: {$raw}"];
+    }
+    $how = 'parsed';
+    return ['value' => (string) $ts];
+}
+
+// Every capabilities blob this user actually has: root plus any subsite.
+function xen_set_access_cap_keys($user_id) {
+    global $wpdb;
+    $rows = $wpdb->get_col($wpdb->prepare(
+        "SELECT meta_key FROM {$wpdb->usermeta}
+         WHERE user_id = %d AND meta_key LIKE %s",
+        $user_id, $wpdb->esc_like($wpdb->base_prefix) . '%capabilities'
+    ));
+    return is_array($rows) ? $rows : [];
+}
+
+function xen_set_access_ccaps_in($caps) {
+    $out = [];
+    if (is_array($caps)) {
+        foreach ($caps as $k => $v) {
+            if ($v && strpos((string) $k, 'access_s2member_ccap_') === 0) {
+                $out[] = $k;
+            }
+        }
+    }
+    return $out;
+}
+
+function xen_users_set_access($request) {
+    global $wpdb;
+
+    $raw_dry = $request->get_param('dry_run');
+    $dry_run = ($raw_dry === null) ? true : rest_sanitize_boolean($raw_dry);
+    $preserve = $request->get_param('preserve_ccaps');
+    $preserve_ccaps = ($preserve === null) ? true : rest_sanitize_boolean($preserve);
+    $allow_partial = rest_sanitize_boolean($request->get_param('allow_partial'));
+    $reason = trim((string) $request->get_param('reason'));
+    $max_batch = (int) ($request->get_param('max_batch') ?: 100);
+
+    $batch_level = $request->get_param('level');
+    $batch_eot   = $request->get_param('auto_eot');
+
+    $users = $request->get_param('users');
+    if (is_string($users) && $users !== '') {
+        $decoded = json_decode($users, true);
+        $users = is_array($decoded) ? $decoded : null;
+    }
+    if (!is_array($users) || !count($users)) {
+        $ident = $request->get_param('user');
+        if ($ident === null || $ident === '') {
+            return new WP_Error('bad_request', 'Provide `user`, or a `users` array.', ['status' => 400]);
+        }
+        $users = [['identifier' => $ident]];
+    }
+
+    // Refuse an oversized batch outright. Truncating would silently half-apply
+    // a cancellation, which is the failure mode this whole surface exists to
+    // avoid.
+    if (count($users) > $max_batch) {
+        return new WP_Error(
+            'batch_too_large',
+            'Batch of ' . count($users) . " exceeds max_batch {$max_batch}. Refusing (not truncating).",
+            ['status' => 400]
+        );
+    }
+
+    if ($reason === '') {
+        return new WP_Error('bad_request', '`reason` is required — it is the audit trail.', ['status' => 400]);
+    }
+
+    // ---- resolve and validate EVERYTHING before writing anything ----------
+    $plans = [];
+    $fatal = [];
+    foreach ($users as $i => $row) {
+        if (!is_array($row)) {
+            $row = ['identifier' => $row];
+        }
+        $ident = $row['identifier'] ?? ($row['user'] ?? ($row['email'] ?? ($row['user_id'] ?? null)));
+        $u = xen_set_access_resolve_user($ident);
+        if (!$u) {
+            $plans[] = ['identifier' => $ident, 'status' => 'not_found'];
+            $fatal[] = "row {$i}: no user matched " . json_encode($ident);
+            continue;
+        }
+
+        $want_level = array_key_exists('level', $row) ? $row['level'] : $batch_level;
+        $want_eot   = array_key_exists('auto_eot', $row) ? $row['auto_eot'] : $batch_eot;
+
+        $new_role = null;
+        if ($want_level !== null && $want_level !== '') {
+            $new_role = xen_set_access_normalize_role($want_level);
+            if ($new_role === null) {
+                $plans[] = ['identifier' => $ident, 'user_id' => $u->ID, 'status' => 'invalid_level'];
+                $fatal[] = "row {$i}: '{$want_level}' is not a registered role. Registered: "
+                    . implode(', ', array_keys(wp_roles()->get_names()));
+                continue;
+            }
+        }
+
+        $how = null;
+        $eot = xen_set_access_normalize_eot($want_eot, $how);
+        if (isset($eot['error'])) {
+            $plans[] = ['identifier' => $ident, 'user_id' => $u->ID, 'status' => 'invalid_auto_eot'];
+            $fatal[] = "row {$i}: " . $eot['error'];
+            continue;
+        }
+
+        if ($new_role === null && !empty($eot['skip'])) {
+            $plans[] = ['identifier' => $ident, 'user_id' => $u->ID, 'status' => 'nothing_requested'];
+            $fatal[] = "row {$i}: neither level nor auto_eot supplied.";
+            continue;
+        }
+
+        $eot_key = $wpdb->base_prefix . 's2member_auto_eot_time';
+        $old_eot = get_user_meta($u->ID, $eot_key, true);
+        $old_role = !empty($u->roles) ? (string) reset($u->roles) : '';
+
+        $blobs = [];
+        foreach (xen_set_access_cap_keys($u->ID) as $ck) {
+            $caps = maybe_unserialize(get_user_meta($u->ID, $ck, true));
+            $blobs[$ck] = [
+                'caps'  => is_array($caps) ? $caps : [],
+                'ccaps' => xen_set_access_ccaps_in($caps),
+            ];
+        }
+        $ccaps_before = [];
+        foreach ($blobs as $b) {
+            $ccaps_before = array_merge($ccaps_before, $b['ccaps']);
+        }
+        $ccaps_before = array_values(array_unique($ccaps_before));
+
+        $role_changes = ($new_role !== null && $new_role !== $old_role);
+        $eot_changes  = !empty($eot['skip']) ? false : ((string) $old_eot !== (string) $eot['value']);
+
+        $plans[] = [
+            'identifier'      => $ident,
+            'user_id'         => $u->ID,
+            'email'           => $u->user_email,
+            'username'        => $u->user_login,
+            'old_level'       => $old_role,
+            'new_level'       => $new_role ?? $old_role,
+            'old_auto_eot'    => ($old_eot === '' ? null : $old_eot),
+            'new_auto_eot'    => !empty($eot['skip']) ? ($old_eot === '' ? null : $old_eot)
+                                                      : ($eot['value'] === '' ? null : $eot['value']),
+            'auto_eot_source' => $how,
+            'ccaps_before'    => $ccaps_before,
+            'ccaps_after'     => $preserve_ccaps ? $ccaps_before : [],
+            'flat_ccaps_meta' => get_user_meta($u->ID, 'ccaps', true) ?: null,
+            'capability_blobs'=> array_keys($blobs),
+            'status'          => ($role_changes || $eot_changes) ? 'would_change' : 'already_set',
+            '_apply' => [
+                'role'      => $role_changes ? $new_role : null,
+                'eot'       => $eot_changes ? $eot['value'] : null,
+                'eot_clear' => !empty($eot['clear']),
+                'blobs'     => $blobs,
+            ],
+        ];
+    }
+
+    // Any failure aborts the WHOLE batch unless explicitly allowed to proceed.
+    if ($fatal && !$allow_partial) {
+        foreach ($plans as &$p) {
+            unset($p['_apply']);
+        }
+        unset($p);
+        return new WP_REST_Response([
+            'ok'      => false,
+            'error'   => 'batch_aborted',
+            'message' => 'Nothing was written. Resolve these and re-run: ' . implode(' | ', $fatal),
+            'errors'  => $fatal,
+            'dry_run' => $dry_run,
+            'users'   => $plans,
+        ], 400);
+    }
+
+    $result = [
+        'ok'      => true,
+        'dry_run' => $dry_run,
+        'reason'  => $reason,
+        'preserve_ccaps' => $preserve_ccaps,
+        'count'   => count($plans),
+        'users'   => [],
+        'warnings' => $fatal ? ['proceeded with allow_partial: ' . implode(' | ', $fatal)] : [],
+        '_meta'   => [
+            'site_url' => home_url(),
+            'plugin'   => 'xen-s2member-rest',
+            'writable_keys' => xen_set_access_writable_keys(),
+        ],
+    ];
+
+    foreach ($plans as $p) {
+        $apply = $p['_apply'] ?? null;
+        unset($p['_apply']);
+
+        if ($dry_run || !$apply || $p['status'] !== 'would_change') {
+            if ($dry_run && $p['status'] === 'would_change') {
+                $p['status'] = 'would_change';
+            }
+            $result['users'][] = $p;
+            continue;
+        }
+
+        $uid = $p['user_id'];
+
+        // --- role: swap ONLY the role key, restore ccaps, every blob -------
+        if ($apply['role'] !== null) {
+            foreach ($apply['blobs'] as $cap_key => $info) {
+                $caps = $info['caps'];
+                foreach (array_keys($caps) as $k) {
+                    if (strpos((string) $k, 'access_s2member_ccap_') === 0) {
+                        continue; // ccaps are not roles; leave them be
+                    }
+                    unset($caps[$k]);
+                }
+                $caps[$apply['role']] = true;
+                if ($preserve_ccaps) {
+                    foreach ($info['ccaps'] as $cc) {
+                        $caps[$cc] = true;
+                    }
+                }
+                update_user_meta($uid, $cap_key, $caps);
+            }
+        }
+
+        // --- auto-EOT ------------------------------------------------------
+        $eot_key = $wpdb->base_prefix . 's2member_auto_eot_time';
+        if ($apply['eot'] !== null || $apply['eot_clear']) {
+            if ($apply['eot_clear']) {
+                delete_user_meta($uid, $eot_key);
+            } else {
+                update_user_meta($uid, $eot_key, $apply['eot']);
+            }
+        }
+
+        // --- audit: s2Member notes + our own key, both APPEND --------------
+        $stamp = gmdate('c');
+        $note_key = $wpdb->base_prefix . 's2member_notes';
+        $notes = (string) get_user_meta($uid, $note_key, true);
+        $line = "MCP set-access {$stamp}: level {$p['old_level']} -> {$p['new_level']}"
+              . ($apply['eot_clear'] ? ', auto_eot cleared'
+                                     : ($apply['eot'] !== null ? ", auto_eot -> {$apply['eot']}" : ''))
+              . " | {$reason}";
+        update_user_meta($uid, $note_key, trim($notes . "\n" . $line));
+
+        $audit = get_user_meta($uid, 'xen_mcp_access_audit', true);
+        if (!is_array($audit)) {
+            $audit = [];
+        }
+        $audit[] = [
+            'ts' => $stamp, 'reason' => $reason,
+            'old_level' => $p['old_level'], 'new_level' => $p['new_level'],
+            'old_auto_eot' => $p['old_auto_eot'], 'new_auto_eot' => $p['new_auto_eot'],
+        ];
+        update_user_meta($uid, 'xen_mcp_access_audit', $audit);
+
+        // --- readback: never report success from the request alone ---------
+        clean_user_cache($uid);
+        wp_cache_delete($uid, 'user_meta');
+        $fresh = get_userdata($uid);
+        $now_role = ($fresh && !empty($fresh->roles)) ? (string) reset($fresh->roles) : '';
+        $now_eot  = get_user_meta($uid, $eot_key, true);
+
+        $now_ccaps = [];
+        foreach (xen_set_access_cap_keys($uid) as $ck) {
+            $now_ccaps = array_merge(
+                $now_ccaps,
+                xen_set_access_ccaps_in(maybe_unserialize(get_user_meta($uid, $ck, true)))
+            );
+        }
+        $now_ccaps = array_values(array_unique($now_ccaps));
+
+        $role_ok = ($apply['role'] === null) || ($now_role === $apply['role']);
+        $eot_ok  = true;
+        if ($apply['eot_clear']) {
+            $eot_ok = ($now_eot === '' || $now_eot === null || $now_eot === false);
+        } elseif ($apply['eot'] !== null) {
+            $eot_ok = ((string) $now_eot === (string) $apply['eot']);
+        }
+        $ccap_ok = !$preserve_ccaps || (count($now_ccaps) >= count($p['ccaps_before']));
+
+        $p['new_level']    = $now_role;
+        $p['new_auto_eot'] = ($now_eot === '' || $now_eot === false) ? null : $now_eot;
+        $p['ccaps_after']  = $now_ccaps;
+        $p['flat_ccaps_meta_after'] = get_user_meta($uid, 'ccaps', true) ?: null;
+        $p['status'] = ($role_ok && $eot_ok && $ccap_ok) ? 'applied' : 'write_unconfirmed';
+
+        if (!$ccap_ok) {
+            $result['warnings'][] = "user {$uid}: ccaps went from "
+                . count($p['ccaps_before']) . ' to ' . count($now_ccaps)
+                . ' — the roster export may no longer see this member. INVESTIGATE.';
+        }
+        if ($p['status'] === 'write_unconfirmed') {
+            $result['ok'] = false;
+        }
+
+        $result['users'][] = $p;
+    }
+
+    if (!$dry_run) {
+        wp_cache_flush();
+    }
+
+    $result['summary'] = array_count_values(array_map(
+        function ($u) { return $u['status']; }, $result['users']
+    ));
+    $result['message'] = $dry_run
+        ? 'DRY RUN — nothing written. Send dry_run=false to apply.'
+        : 'Applied. Every row was verified by reading the record back.';
+    return $result;
+}
+
+add_action('rest_api_init', function () {
+    register_rest_route('xen/v1', '/users/set-access', [
+        'methods'             => 'POST',
+        'permission_callback' => function () { return current_user_can('edit_users'); },
+        'args' => [
+            'user'     => ['required' => false, 'description' => 'Single target: ID, email, login, or slug.'],
+            'users'    => ['required' => false, 'description' => 'Batch: array of {identifier, level?, auto_eot?}.'],
+            'level'    => ['required' => false, 'description' => '0-5, a role slug, or "demoted". Batch default.'],
+            'auto_eot' => ['required' => false, 'description' => 'YYYY-MM-DD, unix seconds, or "clear". Batch default.'],
+            'preserve_ccaps' => ['default' => true, 'type' => 'boolean'],
+            'dry_run'        => ['default' => true, 'type' => 'boolean'],
+            'allow_partial'  => ['default' => false, 'type' => 'boolean'],
+            'max_batch'      => ['default' => 100, 'type' => 'integer'],
+            'reason'         => ['required' => true, 'type' => 'string', 'sanitize_callback' => 'sanitize_text_field'],
+        ],
+        'callback' => 'xen_users_set_access',
+    ]);
+});
+
