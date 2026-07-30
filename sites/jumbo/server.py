@@ -1518,6 +1518,119 @@ async def reset_acp_user_column_order(
 # <<< acp-user-prefs (managed by claude) <<<
 
 
+# >>> gated-content-read (managed by claude) >>>
+# =============================================================================
+# get_content — authenticated read for gated post types (jumbo-qa-rest 2.8.0+)
+# =============================================================================
+#
+# Confirmation pages are the `event` post type, which Jumbo sites deliberately
+# do not expose via core REST. Auditing them used to mean pulling a magic link
+# from a test email, authenticating a real browser and parsing the DOM — which
+# cannot run headless in the branch-profile pipeline.
+#
+# IMPORTANT, verified on both AAR sites 2026-07-30: post_content is EMPTY on
+# these pages. The body lives in the ACF field `hero_text_upcoming`, and the
+# rest of the page in ~240 other meta keys. Assertions belong against `meta`
+# and `searchable_text`, not `content_raw`.
+
+_CONTENT_MIN_VERSION = (2, 8, 0)
+
+
+@mcp.tool(
+    description=(
+        "Read page content for GATED post types on the active Jumbo site — "
+        "`event` (confirmation pages), `clip`, `segment`, `announcement`, "
+        "`email` — which are deliberately not exposed via core REST. "
+        "Read-only, admin-gated; the anonymous surface is unchanged.\n"
+        "\n"
+        "USE FOR confirmation-page QA: asserting that a page carries the right "
+        "AddEvent calendar key, location, dates and segment copy, and that "
+        "another segment's copy has NOT leaked in during a site fork — the "
+        "failure a human reviewer is least likely to spot.\n"
+        "\n"
+        "READ THIS BEFORE WRITING ASSERTIONS: on this platform `content_raw` "
+        "(post_content) is EMPTY for confirmation pages. Verified on all six "
+        "AAR pages. The body is in the ACF field `hero_text_upcoming` and the "
+        "page is assembled from ~240 meta keys. Assert against `meta` (a "
+        "specific field) or `searchable_text` (every scalar meta value "
+        "flattened into one haystack, for 'does this page mention X' checks). "
+        "Asserting on content_raw will silently pass on empty strings.\n"
+        "\n"
+        "This is a LOOKUP endpoint, not a site dump — one of slug, id or "
+        "search is required.\n"
+        "\n"
+        "Args:\n"
+        "  slug: exact post_name, e.g. 'confirmation-concord'.\n"
+        "  id: direct post ID.\n"
+        "  search: substring match against slug or title.\n"
+        "  post_type: default 'any'; pass 'event' to scope.\n"
+        "  status: default 'publish'; 'any' is permitted.\n"
+        "  fields: trim the payload. Default includes meta.\n"
+        "\n"
+        "Requires jumbo-qa-rest.php v2.8.0+; older sites report a clear "
+        "message rather than a bare 404."
+    ),
+)
+async def get_content(
+    slug: str | None = None,
+    id: int | None = None,
+    search: str | None = None,
+    post_type: str = "any",
+    status: str = "publish",
+    fields: str | None = None,
+    per_page: int = 20,
+) -> dict:
+    if not slug and not id and not search:
+        return {
+            "ok": False,
+            "error": "Provide one of slug, id, or search — this is a lookup, not a site dump.",
+        }
+
+    s = _active()
+    raw, parsed, err = await _jq_version(s)
+    if err:
+        return {"ok": False, "site": s.name, "error": err,
+                "hint": "Is jumbo-qa-rest.php deployed on this site?"}
+    if parsed is None or parsed < _CONTENT_MIN_VERSION:
+        want = ".".join(str(n) for n in _CONTENT_MIN_VERSION)
+        return {
+            "ok": False, "site": s.name, "error": "plugin_too_old",
+            "installed_version": raw, "required_version": want,
+            "message": f"{s.name} runs jumbo-qa-rest.php {raw!r}; get_content needs {want}+.",
+        }
+
+    params: dict[str, Any] = {"post_type": post_type, "status": status,
+                             "per_page": min(per_page, 100)}
+    if slug:
+        params["slug"] = slug
+    if id:
+        params["id"] = id
+    if search:
+        params["search"] = search
+    if fields:
+        params["fields"] = fields
+
+    try:
+        r = await _jq_request("GET", "/content", params)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "site": s.name, "error": _err("get_content", e)}
+
+    if isinstance(data, dict):
+        data["site"] = s.name
+        # Flag the empty-post_content trap rather than letting a caller write
+        # an assertion that passes vacuously.
+        for p in data.get("posts") or []:
+            if not (p.get("content_raw") or "") and p.get("meta"):
+                p["_note"] = (
+                    "post_content is empty — this page is built from ACF meta. "
+                    "Assert against meta['hero_text_upcoming'] or searchable_text."
+                )
+    return data
+# <<< gated-content-read (managed by claude) <<<
+
+
 if __name__ == "__main__":
     print(
         f"[wp-jumbo-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",
