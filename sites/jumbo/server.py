@@ -1169,6 +1169,189 @@ async def bulk_update_user_meta(
             "summary": _summarize(rows), "rows": rows}
 # <<< user-meta-write-tools (managed by claude) <<<
 
+
+# >>> acp-transplant (managed by claude) >>>
+# =============================================================================
+# ACP column-set transplant — wraps POST /jumbo-qa/v1/acp/transplant (v2.6.0+)
+# =============================================================================
+#
+# Admin Columns Pro's import ALWAYS creates a new named column set and never
+# overwrites the untitled default set users actually see. So an exported column
+# config cannot be applied to an existing site without hand-clicking every
+# column or an SSH/WP-CLI database edit. This moves the payload ACP itself
+# produced onto the default set.
+#
+# NOTE ON `site`: the ticket specified this should target the ambient active
+# site (switch_site context). It takes an EXPLICIT site instead, matching the
+# hard rule the other write tools in this server follow — a write must name its
+# target so it can never land on the wrong client's site. Wrong-site here means
+# silently replacing a live client's default column set; recoverable from the
+# backup, but only if someone notices. Reads stay ambient; writes are named.
+
+_ACP_TRANSPLANT_MIN_VERSION = (2, 6, 0)
+
+
+def _parse_plugin_version(v: Any) -> tuple[int, ...] | None:
+    """'2.6.0' -> (2, 6, 0). Returns None for anything unparseable."""
+    if not isinstance(v, str):
+        return None
+    parts = v.strip().split(".")
+    try:
+        return tuple(int(p) for p in parts[:3])
+    except ValueError:
+        return None
+
+
+@mcp.tool(
+    description=(
+        "Transplant an Admin Columns Pro column config from an imported column "
+        "set onto an existing (default) set on ONE explicit Jumbo site. "
+        "Dry-run by default — pass dry_run=False to actually write.\n"
+        "\n"
+        "WHY: ACP's import always creates a NEW named column set and never "
+        "overwrites the untitled default set users actually see when they open "
+        "a list table. So export/import cannot update an existing site's "
+        "default columns. Workflow: (1) import the JSON in wp-admin so ACP "
+        "builds and validates a real config, (2) call this to move that config "
+        "onto the default set, (3) delete the leftover imported set in the UI.\n"
+        "\n"
+        "SAFE BECAUSE it never authors a column config — it copies a payload "
+        "ACP itself produced, so key hashes, type strings and serialization are "
+        "ACP's own work. Only the `columns` field moves; title, settings, "
+        "list_key and list_id on the target are untouched, so the target keeps "
+        "its identity and stays the default set.\n"
+        "\n"
+        "THIS IS A REPLACE, NOT A MERGE. Columns the target has and the source "
+        "lacks are LOST. Always read `losses` in the dry run before writing.\n"
+        "\n"
+        "Args:\n"
+        "  site: REQUIRED site name from list_sites. Never inferred from the "
+        "active site — a write must name its target.\n"
+        "  from_list_id: source set (the one ACP created on import).\n"
+        "  to_list_id: target set (the default, usually untitled one). Use "
+        "get_acp_list_screens / the acp/list-screens endpoint to find both.\n"
+        "  dry_run: default True. Returns the full plan — gains, losses, "
+        "warnings — without writing.\n"
+        "\n"
+        "READ `warnings` BEFORE WRITING. It flags absolute URLs pointing at "
+        "another host, the cross-site import leftover that renders fine and "
+        "links off-site, which a human reviewing the list table will not "
+        "notice. It also restates any column losses.\n"
+        "\n"
+        "The target's previous columns are backed up to an option row before "
+        "any write, and the column count is verified by re-reading the row "
+        "afterward; the backup key is returned either way.\n"
+        "\n"
+        "Requires jumbo-qa-rest.php v2.6.0+ on the target site. Version is "
+        "checked first so an older site reports a clear message instead of a "
+        "bare 404."
+    ),
+)
+async def acp_transplant_columns(
+    site: str,
+    from_list_id: str,
+    to_list_id: str,
+    dry_run: bool = True,
+) -> dict:
+    try:
+        s = _resolve_site(site)
+    except ValueError as e:
+        return {"ok": False, "error": str(e), "dry_run": dry_run}
+
+    if not from_list_id or not to_list_id:
+        return {
+            "ok": False,
+            "error": "from_list_id and to_list_id are both required.",
+            "site": s.name, "dry_run": dry_run,
+        }
+    if from_list_id == to_list_id:
+        return {
+            "ok": False,
+            "error": "from_list_id and to_list_id are the same — nothing to do.",
+            "site": s.name, "dry_run": dry_run,
+        }
+
+    # Version gate. Sites are on mixed versions during rollout, and a bare 404
+    # from a 2.5.x site looks like a broken route rather than an old plugin.
+    try:
+        wr = await _get_site(s, "/wp-json/jumbo-qa/v1/whoami")
+        wr.raise_for_status()
+        installed_raw = (wr.json() or {}).get("version")
+    except Exception as e:
+        return {
+            "ok": False,
+            "site": s.name,
+            "error": _err("acp_transplant_columns (version check)", e),
+            "hint": "Could not reach /jumbo-qa/v1/whoami — is jumbo-qa-rest.php deployed on this site?",
+            "dry_run": dry_run,
+        }
+
+    installed = _parse_plugin_version(installed_raw)
+    if installed is None or installed < _ACP_TRANSPLANT_MIN_VERSION:
+        want = ".".join(str(n) for n in _ACP_TRANSPLANT_MIN_VERSION)
+        return {
+            "ok": False,
+            "site": s.name,
+            "error": "plugin_too_old",
+            "installed_version": installed_raw,
+            "required_version": want,
+            "message": (
+                f"{s.name} is running jumbo-qa-rest.php {installed_raw!r}; the "
+                f"transplant endpoint needs {want}+. Deploy the updated "
+                f"mu-plugin to this site first."
+            ),
+            "dry_run": dry_run,
+        }
+
+    try:
+        r = await _post_site(
+            s,
+            "/wp-json/jumbo-qa/v1/acp/transplant",
+            {
+                "from_list_id": from_list_id,
+                "to_list_id": to_list_id,
+                "dry_run": bool(dry_run),
+            },
+        )
+    except Exception as e:
+        return {
+            "ok": False, "site": s.name, "dry_run": dry_run,
+            "error": _err("acp_transplant_columns", e),
+        }
+
+    try:
+        data = r.json()
+    except Exception:
+        return {
+            "ok": False, "site": s.name, "dry_run": dry_run,
+            "error": f"HTTP {r.status_code}, non-JSON body: {r.text[:300]}",
+        }
+
+    if not isinstance(data, dict):
+        return {"ok": False, "site": s.name, "dry_run": dry_run, "raw": data}
+
+    data["site"] = s.name
+    data["plugin_version"] = installed_raw
+
+    # Hoist warnings so they cannot be missed in a long result. The off-site
+    # URL case is precisely the one a human scanning this would skip past.
+    warnings = data.get("warnings") or []
+    if warnings:
+        data["ATTENTION"] = warnings
+
+    _audit(
+        s,
+        "acp_transplant_columns",
+        f"{from_list_id}->{to_list_id}",
+        "acp.columns",
+        data.get("to", {}).get("column_count_before"),
+        data.get("to", {}).get("column_count_after"),
+        ("dry_run" if dry_run else ("applied" if data.get("ok") else "failed")),
+    )
+    return data
+# <<< acp-transplant (managed by claude) <<<
+
+
 if __name__ == "__main__":
     print(
         f"[wp-jumbo-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",
