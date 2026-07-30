@@ -1352,6 +1352,172 @@ async def acp_transplant_columns(
 # <<< acp-transplant (managed by claude) <<<
 
 
+# >>> acp-user-prefs (managed by claude) >>>
+# =============================================================================
+# ACP per-user column preferences — inspect and reset (jumbo-qa-rest 2.7.0+)
+# =============================================================================
+#
+# ACP honours a per-user saved column order ABOVE the shared column set. So a
+# transplant can land perfectly and still change nothing on a given admin's
+# screen. The database is right, their view is stale, and the only symptom is
+# two admins describing the same list differently.
+#
+# Clearing the personal override makes that user inherit the set order — and
+# keep inheriting it on every future transplant, which is what makes the ACP
+# export the single source of truth for column order across a multi-site build.
+
+_ACP_USER_PREFS_MIN_VERSION = (2, 7, 0)
+
+
+async def _jq_version(s: SiteConfig) -> tuple[Any, tuple[int, ...] | None, str | None]:
+    """(raw_version, parsed_version, error_string)."""
+    try:
+        r = await _get_site(s, "/wp-json/jumbo-qa/v1/whoami")
+        r.raise_for_status()
+        raw = (r.json() or {}).get("version")
+        return raw, _parse_plugin_version(raw), None
+    except Exception as e:
+        return None, None, _err("whoami", e)
+
+
+@mcp.tool(
+    description=(
+        "Inspect ONE user's Admin Columns Pro preferences on an explicit Jumbo "
+        "site, and show what they would inherit if those preferences were "
+        "cleared. Read-only.\n"
+        "\n"
+        "USE THIS when a column change is live in the database but someone says "
+        "they cannot see it. ACP honours a per-user saved column order ABOVE "
+        "the shared set, so a transplant can land correctly and still leave an "
+        "admin looking at a stale layout. Verified on aar-u65: one admin saw "
+        "the aar_* columns at positions 4-9 while a preference-less admin saw "
+        "the identical set render them at 10-15.\n"
+        "\n"
+        "Returns the user's ACP preference keys and values, which column set is "
+        "active per list screen, `has_personal_column_order`, and a per-list "
+        "comparison of their saved order against the shared set's order.\n"
+        "\n"
+        "Args:\n"
+        "  site: REQUIRED site name from list_sites.\n"
+        "  user: user ID, login, or email."
+    ),
+)
+async def get_acp_user_prefs(site: str, user: str) -> dict:
+    try:
+        s = _resolve_site(site)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+
+    raw, parsed, err = await _jq_version(s)
+    if err:
+        return {"ok": False, "site": s.name, "error": err,
+                "hint": "Is jumbo-qa-rest.php deployed on this site?"}
+    if parsed is None or parsed < _ACP_USER_PREFS_MIN_VERSION:
+        want = ".".join(str(n) for n in _ACP_USER_PREFS_MIN_VERSION)
+        return {
+            "ok": False, "site": s.name, "error": "plugin_too_old",
+            "installed_version": raw, "required_version": want,
+            "message": f"{s.name} runs jumbo-qa-rest.php {raw!r}; this needs {want}+.",
+        }
+
+    try:
+        r = await _get_site(s, "/wp-json/jumbo-qa/v1/acp/user-prefs", {"user": user})
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "site": s.name, "error": _err("get_acp_user_prefs", e)}
+    if isinstance(data, dict):
+        data["site"] = s.name
+    return data
+
+
+@mcp.tool(
+    description=(
+        "Clear ONE user's saved Admin Columns Pro column order on an explicit "
+        "Jumbo site, so they inherit the shared column set's order instead. "
+        "Dry-run by default — pass dry_run=False to actually delete.\n"
+        "\n"
+        "WHY: ACP honours a per-user saved order above the shared set. An admin "
+        "carrying a stale personal arrangement keeps seeing the old layout "
+        "after a successful transplant. Clearing the override makes them track "
+        "the set permanently, including on every future transplant — so the ACP "
+        "export stays the single source of truth for column order.\n"
+        "\n"
+        "SCOPE: only ACP preference keys and WordPress per-user hidden-column "
+        "keys can be cleared, one named user per call. There is deliberately no "
+        "bulk sweep: a personal column arrangement may be a deliberate choice, "
+        "and clearing someone else's is not a decision to make on their behalf. "
+        "Get explicit agreement before resetting an account that is not yours.\n"
+        "\n"
+        "By default this clears ONLY the saved column order. Column widths, "
+        "sorting and the active-set choice are separate personal settings and "
+        "are left alone unless named in `keys`.\n"
+        "\n"
+        "Values are backed up to an option row before deletion, and the result "
+        "is verified by re-reading the user's meta, so a reset is reversible.\n"
+        "\n"
+        "Args:\n"
+        "  site: REQUIRED site name from list_sites.\n"
+        "  user: user ID, login, or email.\n"
+        "  keys: optional comma-separated preference keys. Omit for the "
+        "default (saved column order only).\n"
+        "  dry_run: default True. Shows the exact values that would be removed "
+        "and the order the user would inherit, without deleting."
+    ),
+)
+async def reset_acp_user_column_order(
+    site: str,
+    user: str,
+    keys: str | None = None,
+    dry_run: bool = True,
+) -> dict:
+    try:
+        s = _resolve_site(site)
+    except ValueError as e:
+        return {"ok": False, "error": str(e), "dry_run": dry_run}
+
+    raw, parsed, err = await _jq_version(s)
+    if err:
+        return {"ok": False, "site": s.name, "dry_run": dry_run, "error": err,
+                "hint": "Is jumbo-qa-rest.php deployed on this site?"}
+    if parsed is None or parsed < _ACP_USER_PREFS_MIN_VERSION:
+        want = ".".join(str(n) for n in _ACP_USER_PREFS_MIN_VERSION)
+        return {
+            "ok": False, "site": s.name, "dry_run": dry_run,
+            "error": "plugin_too_old", "installed_version": raw,
+            "required_version": want,
+            "message": f"{s.name} runs jumbo-qa-rest.php {raw!r}; this needs {want}+.",
+        }
+
+    body: dict[str, Any] = {"user": user, "dry_run": bool(dry_run)}
+    if keys:
+        body["keys"] = keys
+
+    try:
+        r = await _post_site(s, "/wp-json/jumbo-qa/v1/acp/user-prefs/reset", body)
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "site": s.name, "dry_run": dry_run,
+                "error": _err("reset_acp_user_column_order", e)}
+
+    if not isinstance(data, dict):
+        return {"ok": False, "site": s.name, "dry_run": dry_run, "raw": data}
+
+    data["site"] = s.name
+    data["plugin_version"] = raw
+
+    _audit(
+        s,
+        "reset_acp_user_column_order",
+        (data.get("user") or {}).get("id", user),
+        ",".join(data.get("keys_to_clear") or []) or "(none)",
+        data.get("current_values"),
+        None,
+        ("dry_run" if dry_run else ("applied" if data.get("ok") else "failed")),
+    )
+    return data
+# <<< acp-user-prefs (managed by claude) <<<
+
+
 if __name__ == "__main__":
     print(
         f"[wp-jumbo-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",
