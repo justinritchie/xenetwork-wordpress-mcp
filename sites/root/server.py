@@ -1321,6 +1321,234 @@ async def bulk_set_member_access(
     return await _set_access_call(payload)
 
 
+# ---------------------------------------------------------------------------
+# Formidable Forms — FIELD STRUCTURE writes (additive by default)
+# ---------------------------------------------------------------------------
+#
+# Structure only. There are deliberately NO entry write tools and none should be
+# added: form 10's entries are member cancellation submissions and are potential
+# evidence. Read-only on entries is a constraint, not an omission.
+#
+# The single most important fact about this surface, learned from live data
+# 2026-08-01: entry metas bind the "Other" option by its KEY, not its label —
+#
+#     "105": {"other_4": "New status of ETS publication."}
+#
+# 8 of 100 sampled entries on form 10 use that shape (~150 of 1,930). Renaming
+# or renumbering an option key orphans those entries, and the field reads back
+# as perfectly correct afterwards. Hence: option keys are immutable, and display
+# position is controlled by ARRAY ORDER, which is independent of key names.
+
+
+def _coerce_json(v: Any) -> Any:
+    """Accept a real object/list or a JSON string. MCP clients send both."""
+    if v is None or isinstance(v, (dict, list)):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            return json.loads(s)
+        except Exception:
+            return [s]  # a bare label is a legitimate single-option append
+    return v
+
+
+async def _frm_post(path: str, payload: dict[str, Any], stage: str) -> dict | str:
+    try:
+        r = await client.post(f"{WP_BASE}/wp-json/xen/v1{path}", json=payload)
+    except Exception as e:
+        return _err(stage, e)
+    try:
+        data = r.json()
+    except Exception:
+        return f"ERROR ({stage}): HTTP {r.status_code}, non-JSON: {r.text[:300]}"
+    if isinstance(data, dict):
+        # A refusal is the tool working correctly, not a crash — surface the
+        # reason where it cannot be skimmed past.
+        if data.get("ok") is False:
+            data["ATTENTION"] = data.get("message") or data.get("error")
+        ig = data.get("integrity") or {}
+        if ig.get("existing_keys_removed") or ig.get("existing_keys_altered"):
+            data["ATTENTION"] = (
+                "This changed or removed EXISTING option keys — historical entries "
+                "that referenced them may now be orphaned. Verify before trusting."
+            )
+    return data
+
+
+@mcp.tool(
+    description=(
+        "Modify an existing Formidable field on xenetwork.org — most often to "
+        "ADD a choice to a checkbox/radio/select field. Dry-run by default; "
+        "pass dry_run=False to write.\n"
+        "\n"
+        "ADDITIVE BY DEFAULT AND THAT MATTERS. Entry metas bind the 'Other' "
+        "option by its KEY, not its label — a real entry stores "
+        "{\"105\": {\"other_4\": \"free text\"}}. Renaming or renumbering an "
+        "option key orphans every entry that used it, and the field still reads "
+        "back as correct. So this refuses to remove or alter any existing option "
+        "key unless allow_destructive=True. Renaming a LABEL is equally "
+        "dangerous on fields where label == value (the common case here), "
+        "because the label IS the stored value.\n"
+        "\n"
+        "POSITIONING WITHOUT RENAMING: option keys are identifiers, not "
+        "positions. Display order follows array order. Use insert_before_key to "
+        "place a new choice anywhere — no existing key is touched.\n"
+        "\n"
+        "Args:\n"
+        "  field_id: the field to change. Never reassigned; mutated in place.\n"
+        "  form_id: cross-check — refuses if the field is not on this form. "
+        "Supply it; a wrong form_id usually means a wrong field.\n"
+        "  append_options: list of labels, or [{label, value}]. Additive.\n"
+        "  insert_before_key: existing option key to splice ahead of, e.g. "
+        "'other_4' to land just before Other. Order only.\n"
+        "  name / description / required / field_order: scalar edits.\n"
+        "  options: FULL replacement of the options array. Destructive — "
+        "requires allow_destructive=True. Avoid.\n"
+        "  allow_destructive: default False. Leave it False.\n"
+        "  dry_run: default True. Returns the exact before/after and an "
+        "integrity block without writing.\n"
+        "\n"
+        "ALWAYS read `integrity` before trusting a write: existing_keys_removed "
+        "and existing_keys_altered must both be empty, and field_id_preserved / "
+        "field_key_preserved must both be true. Every write is verified by "
+        "re-reading the field; a failed verification reports "
+        "post_write_verification_failed rather than success."
+    ),
+    annotations={"destructiveHint": True, "idempotentHint": False, "openWorldHint": True},
+)
+async def update_form_field(
+    field_id: int,
+    form_id: int | None = None,
+    append_options: Any = None,
+    insert_before_key: str | None = None,
+    name: str | None = None,
+    description: str | None = None,
+    required: int | None = None,
+    field_order: int | None = None,
+    options: Any = None,
+    allow_destructive: bool = False,
+    dry_run: bool = True,
+) -> dict | str:
+    payload: dict[str, Any] = {
+        "field_id": int(field_id),
+        "dry_run": bool(dry_run),
+        "allow_destructive": bool(allow_destructive),
+    }
+    if form_id is not None:
+        payload["form_id"] = int(form_id)
+    ao = _coerce_json(append_options)
+    if ao:
+        payload["append_options"] = ao if isinstance(ao, list) else [ao]
+    if insert_before_key:
+        payload["insert_before_key"] = insert_before_key
+    if name is not None:
+        payload["name"] = name
+    if description is not None:
+        payload["description"] = description
+    if required is not None:
+        payload["required"] = int(required)
+    if field_order is not None:
+        payload["field_order"] = int(field_order)
+    op = _coerce_json(options)
+    if op is not None:
+        payload["options"] = op
+    return await _frm_post(f"/frm/fields/{int(field_id)}", payload, "update_form_field")
+
+
+@mcp.tool(
+    description=(
+        "Add ONE new field to a Formidable form on xenetwork.org, optionally "
+        "with conditional logic. Dry-run by default; pass dry_run=False to "
+        "create.\n"
+        "\n"
+        "Adding a field is inherently safe for existing data — it gets a new "
+        "field_id and touches nothing that exists. No entry can be affected.\n"
+        "\n"
+        "CONDITIONAL LOGIC — READ BEFORE TRUSTING IT. Pass conditional as "
+        "{'conditions': [{'field': '105', 'operator': '==', 'value': 'No longer "
+        "listen to the episodes'}], 'show_hide': 'show', 'any_all': 'any'}. "
+        "Operators: == != > < like 'not like'.\n"
+        "\n"
+        "The container shape is confirmed against this install, but NO field on "
+        "xenetwork.org currently uses conditional logic — 25 fields carry the "
+        "scaffold and all are empty. So whether `field` wants a field ID or a "
+        "field key, and whether `value` wants an option's label or its key, is "
+        "from Formidable's documented model and NOT observed here. Well-formed "
+        "output is not the same as correct. Prove it on a THROWAWAY form first: "
+        "create one conditional field, then open it in the Formidable builder "
+        "and confirm the condition displays as intended. A condition that "
+        "round-trips through this API but renders blank in the builder is the "
+        "failure to watch for.\n"
+        "\n"
+        "Args:\n"
+        "  form_id / type / name: required. type is one of text, textarea, "
+        "checkbox, radio, select, email, number, url, phone, date, hidden.\n"
+        "  options: for choice types — list of labels or [{label, value}].\n"
+        "  conditional: see above.\n"
+        "  description / required / field_order: optional.\n"
+        "  dry_run: default True — returns the exact record that would be "
+        "created, including the computed field_options.\n"
+        "\n"
+        "Returns the new field_id and the record re-read from the database."
+    ),
+    annotations={"destructiveHint": False, "idempotentHint": False, "openWorldHint": True},
+)
+async def add_form_field(
+    form_id: int,
+    type: str,
+    name: str,
+    description: str | None = None,
+    required: int = 0,
+    field_order: int | None = None,
+    options: Any = None,
+    conditional: Any = None,
+    dry_run: bool = True,
+) -> dict | str:
+    payload: dict[str, Any] = {
+        "form_id": int(form_id),
+        "type": type,
+        "name": name,
+        "required": int(required),
+        "dry_run": bool(dry_run),
+    }
+    if description is not None:
+        payload["description"] = description
+    if field_order is not None:
+        payload["field_order"] = int(field_order)
+    op = _coerce_json(options)
+    if op is not None:
+        payload["options"] = op
+    cond = _coerce_json(conditional)
+    if cond is not None:
+        payload["conditional"] = cond
+    return await _frm_post(f"/frm/forms/{int(form_id)}/fields", payload, "add_form_field")
+
+
+@mcp.tool(
+    description=(
+        "Diagnostic: list Formidable fields on xenetwork.org that carry "
+        "conditional logic, with the raw condition structure. Read-only.\n"
+        "\n"
+        "Use this to learn the REAL shape of conditional logic from live data "
+        "rather than assuming one. As of 2026-08-01 it returns 25 fields whose "
+        "scaffold exists but is empty — i.e. nothing on this install actually "
+        "uses conditional logic yet. Once a real condition exists, this is how "
+        "you confirm what the builder wrote, which is the check that closes the "
+        "verification gap on add_form_field's conditional support."
+    ),
+)
+async def survey_conditional_logic() -> dict | str:
+    try:
+        r = await client.get(f"{WP_BASE}/wp-json/xen/v1/frm/conditional-survey")
+        r.raise_for_status()
+    except Exception as e:
+        return _err("survey_conditional_logic", e)
+    return r.json()
+
+
 if __name__ == "__main__":
     print(
         f"[wp-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",
