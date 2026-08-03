@@ -1127,22 +1127,60 @@ function xen_subscr_match_confidence($meta_key) {
 function xen_users_find_by_subscr_id($request) {
     global $wpdb;
 
+    // Input parsing, in this order deliberately.
+    //
+    // An earlier version split on commas FIRST, so a JSON array string like
+    // ["I-AAA","I-BBB"] became ["I-AAA and "I-BBB"] — the bracketed first and
+    // last elements then returned an ordinary not_found. On a tool whose entire
+    // job is finding people, a malformed ID that looks like a genuine miss is
+    // the worst available failure: it produces confident wrong conclusions
+    // about whether a member exists. So: decode as JSON first, split second,
+    // scrub stray delimiters third, and reject anything still malformed as a
+    // DISTINCT error rather than letting it masquerade as "no such member".
     $raw = $request->get_param('subscr_id');
-    if (is_string($raw) && strpos($raw, ',') !== false) {
-        $raw = array_map('trim', explode(',', $raw));
-    }
+
     if (is_string($raw)) {
-        $decoded = json_decode($raw, true);
-        $raw = is_array($decoded) ? $decoded : [$raw];
+        $trimmed = trim($raw);
+        $decoded = json_decode($trimmed, true);
+        if (is_array($decoded)) {
+            $raw = $decoded;                       // proper JSON array
+        } elseif (strpos($trimmed, ',') !== false) {
+            $raw = explode(',', $trimmed);         // comma list
+        } else {
+            $raw = [$trimmed];                     // single ID
+        }
     }
+
     $ids = [];
+    $malformed = [];
     foreach ((array) $raw as $v) {
+        // Scrub delimiters that survive a hand-built or half-decoded array.
         $v = trim((string) $v);
-        if ($v !== '') { $ids[$v] = true; }
+        $v = trim($v, " \t\n\r\0\x0B[]\"'");
+        if ($v === '') { continue; }
+        // Gateway profile IDs are alphanumeric with - and _ only. Anything else
+        // is input damage, and saying so beats reporting a phantom miss.
+        if (!preg_match('~^[A-Za-z0-9_\-]+$~', $v)) {
+            $malformed[] = $v;
+            continue;
+        }
+        $ids[$v] = true;
     }
     $ids = array_keys($ids);
+
+    if ($malformed) {
+        return new WP_REST_Response([
+            'ok'        => false,
+            'error'     => 'malformed_subscr_id',
+            'message'   => 'These are not valid subscription IDs (letters, digits, - and _ only). '
+                         . 'Reporting this rather than not_found, so bad input is never mistaken '
+                         . 'for a member who does not exist: ' . implode(', ', $malformed),
+            'malformed' => $malformed,
+            'parsed_ok' => $ids,
+        ], 400);
+    }
     if (!$ids) {
-        return new WP_Error('bad_request', 'Provide subscr_id (string, comma list, or array).', ['status' => 400]);
+        return new WP_Error('bad_request', 'Provide subscr_id (string, comma list, or JSON array).', ['status' => 400]);
     }
     if (count($ids) > 50) {
         return new WP_Error('batch_too_large', 'Max 50 subscription IDs per call. Refusing (not truncating).', ['status' => 400]);
@@ -1235,7 +1273,71 @@ function xen_users_find_by_subscr_id($request) {
     ];
 }
 
+// ===========================================================================
+// GET /xen/v1/diag/s2member-renewal-refs — does renewal automation read
+// subscr_id?
+// ===========================================================================
+//
+// The open question after restoring a subscription ID onto a CANCELLED gateway
+// profile: will s2Member's reminder/renewal cron treat the member as actively
+// subscribed and email them about a renewal that cannot bill?
+//
+// Rather than reason about it, grep s2Member's own source for reads of the
+// subscr_id meta key inside its reminder/cron paths. Read-only, returns file
+// and line references only.
+
+function xen_s2_renewal_refs() {
+    $roots = [WP_PLUGIN_DIR . '/s2member', WP_PLUGIN_DIR . '/s2member-pro'];
+    $hits = []; $scanned = 0; $present = [];
+    foreach ($roots as $root) {
+        if (!is_dir($root)) { continue; }
+        $present[] = basename($root);
+        $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($root));
+        foreach ($it as $f) {
+            if (!$f->isFile() || substr($f->getFilename(), -4) !== '.php') { continue; }
+            $name = strtolower($f->getPathname());
+            // Only the paths that could send a member an email on a schedule.
+            if (!preg_match('~(remind|cron|sched|eot|auto_eot|renew)~', $name)) { continue; }
+            $scanned++;
+            $lines = @file($f->getPathname());
+            if (!$lines) { continue; }
+            foreach ($lines as $n => $line) {
+                if (strpos($line, 'subscr_id') !== false) {
+                    $hits[] = [
+                        'file' => str_replace(WP_PLUGIN_DIR . '/', '', $f->getPathname()),
+                        'line' => $n + 1,
+                        'code' => trim(mb_substr($line, 0, 160)),
+                    ];
+                    if (count($hits) >= 40) { break 3; }
+                }
+            }
+        }
+    }
+    return [
+        'ok' => true,
+        'plugins_present'      => $present,
+        'files_scanned'        => $scanned,
+        'subscr_id_references' => $hits,
+        'reference_count'      => count($hits),
+        'interpretation' => count($hits)
+            ? 'subscr_id IS read inside reminder/cron/EOT paths — restoring it on a '
+              . 'cancelled gateway profile could produce renewal messaging that cannot '
+              . 'bill. Review the lines above before doing this in bulk.'
+            : 'No reads of subscr_id found in reminder/cron/EOT paths. On this evidence '
+              . 'restoring the ID is a record-keeping change, and Auto-EOT governs both '
+              . 'access and messaging. Note this greps only files whose PATH matches '
+              . 'remind/cron/sched/eot/renew — it is strong evidence, not a proof.',
+        '_meta' => ['site' => home_url(), 'plugin' => 'xen-s2member-rest'],
+    ];
+}
+
 add_action('rest_api_init', function () {
+    register_rest_route('xen/v1', '/diag/s2member-renewal-refs', [
+        'methods'             => 'GET',
+        'permission_callback' => function () { return current_user_can('manage_options'); },
+        'callback'            => 'xen_s2_renewal_refs',
+    ]);
+
     register_rest_route('xen/v1', '/users/find-by-subscr-id', [
         'methods'             => 'GET',
         'permission_callback' => function () { return current_user_can('list_users'); },
