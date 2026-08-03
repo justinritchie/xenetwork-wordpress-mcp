@@ -190,7 +190,7 @@ def _err(stage: str, exc: Exception) -> str:
     return f"ERROR ({stage}): {type(exc).__name__}: {exc}"
 
 
-def _trim_user(u: dict) -> dict:
+def _trim_user(u: dict, include_meta: bool = False) -> dict:
     """Drop the heavyweight gravatar/yoast/_links payload to save tokens.
 
     Passes through s2_*-prefixed fields and `_all_meta_inspection` if the
@@ -215,11 +215,22 @@ def _trim_user(u: dict) -> dict:
         "meta": u.get("meta") or None,
         "acf": u.get("acf") or None,
     }
-    # Pass through every s2_*-prefixed field and the inspection dump if the
-    # mu-plugin is live. Missing keys are absent from `u` and skipped silently.
+    # Pass through every s2_*-prefixed field (small, and the useful ones).
+    #
+    # `_all_meta_inspection` is EXCLUDED unless explicitly requested. Measured
+    # 2026-08-03: it is 54% of a member record, 72% of a 10-user page, and
+    # 1.33 MB — roughly 332K TOKENS — on the admin account, which is more than
+    # most context windows hold. Fleets of agents auditing many accounts cannot
+    # afford it by default, and almost no caller needs it. Opt in per call.
     for k, v in u.items():
-        if k.startswith("s2_") or k == "_all_meta_inspection":
+        if k.startswith("s2_"):
             out[k] = v
+        elif k == "_all_meta_inspection" and include_meta:
+            out[k] = v
+    if not include_meta and "_all_meta_inspection" in u:
+        meta = u.get("_all_meta_inspection") or {}
+        out["_meta_key_count"] = len(meta) if isinstance(meta, dict) else None
+        out["_meta_hint"] = "full meta omitted — pass include_meta=True if needed"
     return out
 
 
@@ -235,12 +246,37 @@ def _trim_user(u: dict) -> dict:
     ),
 )
 async def whoami() -> dict | str:
+    """Compact by design.
+
+    _trim_user passes through `_all_meta_inspection`, and on an admin account
+    that dump is ~1.3 MILLION characters — which blew the MCP response cap and
+    made the health-check tool unusable for exactly the account most likely to
+    call it. A health check that cannot return is not a health check, so this
+    builds its own minimal payload instead of trimming a full user record.
+    Use get_user(id) when the full record is genuinely wanted.
+    """
     try:
         r = await client.get("/users/me", params={"context": "edit"})
         r.raise_for_status()
     except Exception as e:
         return _err("whoami", e)
-    return _trim_user(r.json())
+    u = r.json()
+    meta = u.get("_all_meta_inspection") or {}
+    return {
+        "ok": True,
+        "id": u.get("id"),
+        "username": u.get("username"),
+        "email": u.get("email"),
+        "name": u.get("name"),
+        "roles": u.get("roles"),
+        "site": WP_BASE,
+        "meta_key_count": len(meta) if isinstance(meta, dict) else None,
+        "note": (
+            "Compact payload. The full record for this account is ~1.3M "
+            "characters because of the user-meta dump — call get_user(id) "
+            "deliberately if you need it."
+        ),
+    }
 
 
 @mcp.tool(
@@ -251,7 +287,7 @@ async def whoami() -> dict | str:
         "email match the result list is typically 1 item."
     ),
 )
-async def find_user_by_email(email: str) -> list[dict] | str:
+async def find_user_by_email(email: str, include_meta: bool = False) -> list[dict] | str:
     try:
         r = await client.get(
             "/users",
@@ -260,7 +296,7 @@ async def find_user_by_email(email: str) -> list[dict] | str:
         r.raise_for_status()
     except Exception as e:
         return _err("find_user_by_email", e)
-    return [_trim_user(u) for u in r.json()]
+    return [_trim_user(u, include_meta) for u in r.json()]
 
 
 @mcp.tool(
@@ -270,13 +306,13 @@ async def find_user_by_email(email: str) -> list[dict] | str:
         "meta and ACF fields."
     ),
 )
-async def get_user(id: int) -> dict | str:
+async def get_user(id: int, include_meta: bool = False) -> dict | str:
     try:
         r = await client.get(f"/users/{id}", params={"context": "edit"})
         r.raise_for_status()
     except Exception as e:
         return _err("get_user", e)
-    return _trim_user(r.json())
+    return _trim_user(r.json(), include_meta)
 
 
 @mcp.tool(
@@ -299,6 +335,7 @@ async def list_users(
     per_page: int = 25,
     role: str | None = None,
     search: str | None = None,
+    include_meta: bool = False,
 ) -> dict | str:
     params: dict[str, Any] = {
         "context": "edit",
@@ -315,7 +352,7 @@ async def list_users(
     except Exception as e:
         return _err("list_users", e)
     return {
-        "users": [_trim_user(u) for u in r.json()],
+        "users": [_trim_user(u, include_meta) for u in r.json()],
         "total": int(r.headers.get("X-WP-Total", 0)),
         "total_pages": int(r.headers.get("X-WP-TotalPages", 0)),
         "page": page,

@@ -1413,11 +1413,10 @@ function xen_users_set_access($request) {
             continue;
         }
 
-        if ($new_role === null && !empty($eot['skip'])) {
-            $plans[] = ['identifier' => $ident, 'user_id' => $u->ID, 'status' => 'nothing_requested'];
-            $fatal[] = "row {$i}: neither level nor auto_eot supplied.";
-            continue;
-        }
+        // NOTE: the "nothing requested" check lives AFTER the subscription
+        // block below, not here. Restoring a wiped subscr_id is a legitimate
+        // standalone operation — an earlier version rejected it because this
+        // guard ran before subscr_id was parsed.
 
         $eot_key = $wpdb->base_prefix . 's2member_auto_eot_time';
         $old_eot = get_user_meta($u->ID, $eot_key, true);
@@ -1478,6 +1477,14 @@ function xen_users_set_access($request) {
             $ccaps_before = array_merge($ccaps_before, $b['ccaps']);
         }
         $ccaps_before = array_values(array_unique($ccaps_before));
+
+        // Now that every field is parsed, decide whether anything was asked for.
+        if ($new_role === null && !empty($eot['skip']) && $new_sid === null && $new_gw === null) {
+            $plans[] = ['identifier' => $ident, 'user_id' => $u->ID, 'status' => 'nothing_requested'];
+            $fatal[] = "row {$i}: nothing supplied — needs at least one of "
+                     . 'level, auto_eot, subscr_id or subscr_gateway.';
+            continue;
+        }
 
         $role_changes = ($new_role !== null && $new_role !== $old_role);
         $eot_changes  = !empty($eot['skip']) ? false : ((string) $old_eot !== (string) $eot['value']);
