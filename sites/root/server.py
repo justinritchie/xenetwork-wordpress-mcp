@@ -1229,13 +1229,15 @@ async def set_member_access(
     reason: str,
     level: str | None = None,
     auto_eot: str | None = None,
+    subscr_id: str | None = None,
+    subscr_gateway: str | None = None,
     preserve_ccaps: bool = True,
     dry_run: bool = True,
 ) -> dict | str:
     if not reason or not reason.strip():
         return "ERROR: `reason` is required — it is the audit trail."
-    if level is None and auto_eot is None:
-        return "ERROR: supply at least one of level or auto_eot."
+    if level is None and auto_eot is None and subscr_id is None and subscr_gateway is None:
+        return "ERROR: supply at least one of level, auto_eot, subscr_id or subscr_gateway."
     payload: dict[str, Any] = {
         "user": user,
         "reason": reason,
@@ -1246,6 +1248,10 @@ async def set_member_access(
         payload["level"] = level
     if auto_eot is not None:
         payload["auto_eot"] = auto_eot
+    if subscr_id is not None:
+        payload["subscr_id"] = subscr_id
+    if subscr_gateway is not None:
+        payload["subscr_gateway"] = subscr_gateway
     return await _set_access_call(payload)
 
 
@@ -1290,6 +1296,8 @@ async def bulk_set_member_access(
     reason: str,
     level: str | None = None,
     auto_eot: str | None = None,
+    subscr_id: str | None = None,
+    subscr_gateway: str | None = None,
     preserve_ccaps: bool = True,
     dry_run: bool = True,
     allow_partial: bool = False,
@@ -1318,7 +1326,81 @@ async def bulk_set_member_access(
         payload["level"] = level
     if auto_eot is not None:
         payload["auto_eot"] = auto_eot
+    if subscr_id is not None:
+        payload["subscr_id"] = subscr_id
+    if subscr_gateway is not None:
+        payload["subscr_gateway"] = subscr_gateway
     return await _set_access_call(payload)
+
+
+@mcp.tool(
+    description=(
+        "Find the xenetwork.org member behind a payment-gateway subscription / "
+        "profile ID (e.g. a PayPal 'I-XXXXXXXX'). Read-only. Accepts one ID, a "
+        "comma-separated list, or an array — up to 50 per call, so a batch of "
+        "gateway notices reconciles in one request.\n"
+        "\n"
+        "USE THIS when a PayPal or Stripe notice names a subscription you "
+        "cannot tie to an account. The payer email is frequently NOT the member "
+        "email — a spouse, a shared address, or one the member has since "
+        "changed. Verified live: four previously unresolvable notices all "
+        "matched members whose WordPress email differed from the payer.\n"
+        "\n"
+        "WHY NOT list_users: its `search` covers only user_login, nicename, "
+        "email, url and display_name. It does not touch meta, so a profile ID "
+        "returns nothing.\n"
+        "\n"
+        "READ `match_confidence` — it is the point of this tool:\n"
+        "  authoritative  matched s2member_subscr_id, the live field\n"
+        "  strong         matched ipn_signup_vars or subscr_baid, the "
+        "gateway's own signup record\n"
+        "  annotation     matched ONLY notes / audit free text. s2Member does "
+        "not read those. A lead, not proof.\n"
+        "\n"
+        "That distinction matters because s2Member CLEARS subscr_id on "
+        "demotion — and a cancelled subscription is what causes the demotion. "
+        "So the members you most need to find are exactly the ones whose "
+        "authoritative field is gone. A lookup against subscr_id alone returns "
+        "not_found for them while appearing to work.\n"
+        "\n"
+        "Returns a trimmed record per match — id, email, username, "
+        "display_name, roles, auto_eot, subscr_id, subscr_gateway, "
+        "paid_registration_times — deliberately not the full user record, "
+        "which runs thousands of tokens and makes batch auditing impossible. "
+        "Status per ID is found / ambiguous / not_found; an unknown ID is "
+        "not_found, not an error."
+    ),
+)
+async def find_user_by_subscr_id(subscr_id: Any) -> dict | str:
+    if isinstance(subscr_id, list):
+        subscr_id = ",".join(str(s).strip() for s in subscr_id if str(s).strip())
+    subscr_id = (subscr_id or "").strip()
+    if not subscr_id:
+        return "ERROR: provide at least one subscription/profile ID."
+    try:
+        r = await client.get(
+            f"{WP_BASE}/wp-json/xen/v1/users/find-by-subscr-id",
+            params={"subscr_id": subscr_id},
+        )
+        r.raise_for_status()
+    except Exception as e:
+        return _err("find_user_by_subscr_id", e)
+    data = r.json()
+    if isinstance(data, dict):
+        weak = [
+            res["subscr_id"]
+            for res in (data.get("results") or [])
+            for u in (res.get("users") or [])
+            if u.get("match_confidence") == "annotation"
+        ]
+        if weak:
+            data["ATTENTION"] = (
+                "Annotation-only match(es) for "
+                + ", ".join(sorted(set(weak)))
+                + " — found in notes/audit free text, NOT in s2Member's "
+                "subscr_id field (demotion wipes it). Verify before acting."
+            )
+    return data
 
 
 # ---------------------------------------------------------------------------

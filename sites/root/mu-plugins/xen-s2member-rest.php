@@ -1082,9 +1082,170 @@ function xen_set_access_writable_keys() {
         $wpdb->base_prefix . 's2member_auto_eot_time',
         $wpdb->base_prefix . 's2member_notes',
         $wpdb->base_prefix . 's2member_access_cap_times',
+        $wpdb->base_prefix . 's2member_subscr_id',
+        $wpdb->base_prefix . 's2member_subscr_gateway',
         'xen_mcp_access_audit',
     ];
 }
+
+// ===========================================================================
+// GET /xen/v1/users/find-by-subscr-id — resolve a payment profile to a member
+// ===========================================================================
+//
+// WHY A BROAD META SCAN RATHER THAN A LOOKUP ON wp_s2member_subscr_id
+// ---------------------------------------------------------------------------
+// s2Member CLEARS wp_s2member_subscr_id on demotion. Verified 2026-08-03 on
+// users 7367 (Carson Witte) and 9412 (Miles Caldwell): neither has the key at
+// all, and 9412's profile ID `I-0V2YT315BV52` survives ONLY as free text in
+// wp_s2member_notes.
+//
+// That is fatal for the naive implementation, because the population you need
+// to search is exactly the demoted one — a cancelled PayPal profile IS the
+// event that demotes the member. A lookup restricted to wp_s2member_subscr_id
+// would return not_found for every real case while appearing to work.
+//
+// So this scans across the keys where a profile ID can survive, and reports
+// WHICH key matched. That distinction is the whole point: a hit in
+// s2member_subscr_id is authoritative; a hit in `notes` is a human annotation;
+// a hit in ipn_signup_vars is the gateway's own signup record. They warrant
+// different confidence and the caller is told which it got.
+//
+// Read-only. Returns a trimmed record: a full user record runs several
+// thousand tokens and makes batch reconciliation impossible.
+
+function xen_subscr_match_confidence($meta_key) {
+    global $wpdb;
+    $p = $wpdb->base_prefix;
+    if ($meta_key === $p . 's2member_subscr_id')       return ['authoritative', 'live subscription ID field'];
+    if ($meta_key === $p . 's2member_ipn_signup_vars') return ['strong', 'gateway signup record from the IPN payload'];
+    if ($meta_key === $p . 's2member_subscr_baid')     return ['strong', 'billing agreement ID'];
+    if ($meta_key === $p . 's2member_notes')           return ['annotation', 'free text in the notes field — a human or tool wrote it, s2Member does not read it'];
+    if ($meta_key === 'xen_mcp_access_audit')          return ['annotation', 'written by this MCP audit trail'];
+    return ['weak', 'matched an unexpected meta key'];
+}
+
+function xen_users_find_by_subscr_id($request) {
+    global $wpdb;
+
+    $raw = $request->get_param('subscr_id');
+    if (is_string($raw) && strpos($raw, ',') !== false) {
+        $raw = array_map('trim', explode(',', $raw));
+    }
+    if (is_string($raw)) {
+        $decoded = json_decode($raw, true);
+        $raw = is_array($decoded) ? $decoded : [$raw];
+    }
+    $ids = [];
+    foreach ((array) $raw as $v) {
+        $v = trim((string) $v);
+        if ($v !== '') { $ids[$v] = true; }
+    }
+    $ids = array_keys($ids);
+    if (!$ids) {
+        return new WP_Error('bad_request', 'Provide subscr_id (string, comma list, or array).', ['status' => 400]);
+    }
+    if (count($ids) > 50) {
+        return new WP_Error('batch_too_large', 'Max 50 subscription IDs per call. Refusing (not truncating).', ['status' => 400]);
+    }
+
+    $p = $wpdb->base_prefix;
+    $searchable = [
+        $p . 's2member_subscr_id',
+        $p . 's2member_ipn_signup_vars',
+        $p . 's2member_subscr_baid',
+        $p . 's2member_notes',
+        'xen_mcp_access_audit',
+    ];
+
+    $results = [];
+    foreach ($ids as $sid) {
+        $like = '%' . $wpdb->esc_like($sid) . '%';
+        $ph   = implode(',', array_fill(0, count($searchable), '%s'));
+        $args = array_merge($searchable, [$like]);
+        $rows = $wpdb->get_results($wpdb->prepare(
+            "SELECT user_id, meta_key FROM {$wpdb->usermeta}
+              WHERE meta_key IN ({$ph}) AND meta_value LIKE %s
+              LIMIT 25",
+            $args
+        ));
+
+        if (!$rows) {
+            $results[] = ['subscr_id' => $sid, 'status' => 'not_found',
+                          'message' => 'No user record references this subscription ID in any searched key.'];
+            continue;
+        }
+
+        // Group by user; a single member can match on several keys.
+        $by_user = [];
+        foreach ($rows as $r) {
+            $by_user[(int) $r->user_id][] = $r->meta_key;
+        }
+
+        $matches = [];
+        foreach ($by_user as $uid => $keys) {
+            $u = get_userdata($uid);
+            if (!$u) { continue; }
+            $best = 'weak'; $best_key = null;
+            $rank = ['authoritative' => 4, 'strong' => 3, 'annotation' => 2, 'weak' => 1];
+            $sources = [];
+            foreach ($keys as $k) {
+                list($conf, $why) = xen_subscr_match_confidence($k);
+                $sources[] = ['meta_key' => $k, 'confidence' => $conf, 'note' => $why];
+                if ($rank[$conf] > $rank[$best]) { $best = $conf; $best_key = $k; }
+            }
+            $eot = get_user_meta($uid, $p . 's2member_auto_eot_time', true);
+            $matches[] = [
+                'id'            => (int) $uid,
+                'email'         => $u->user_email,
+                'username'      => $u->user_login,
+                'display_name'  => $u->display_name,
+                'roles'         => $u->roles,
+                'auto_eot'      => $eot === '' ? null : $eot,
+                'auto_eot_iso'  => $eot ? gmdate('c', (int) $eot) : null,
+                'subscr_id'     => get_user_meta($uid, $p . 's2member_subscr_id', true) ?: null,
+                'subscr_gateway'=> get_user_meta($uid, $p . 's2member_subscr_gateway', true) ?: null,
+                'paid_registration_times' => maybe_unserialize(
+                    get_user_meta($uid, $p . 's2member_paid_registration_times', true)) ?: null,
+                'match_confidence' => $best,
+                'matched_in'       => $sources,
+            ];
+        }
+
+        $results[] = [
+            'subscr_id' => $sid,
+            'status'    => count($matches) === 1 ? 'found' : (count($matches) > 1 ? 'ambiguous' : 'not_found'),
+            'match_count' => count($matches),
+            'users'     => $matches,
+        ];
+    }
+
+    $summary = [];
+    foreach ($results as $r) { $summary[$r['status']] = ($summary[$r['status']] ?? 0) + 1; }
+
+    return [
+        'ok'      => true,
+        'count'   => count($results),
+        'summary' => $summary,
+        'results' => $results,
+        'searched_keys' => $searchable,
+        'note'    => 'Confidence matters: s2Member CLEARS subscr_id on demotion, so a cancelled '
+                   . 'profile often survives only as an annotation in notes. An "annotation" match '
+                   . 'is a human record, not an s2Member field — treat it as a lead, not proof.',
+        '_meta'   => ['site' => home_url(), 'plugin' => 'xen-s2member-rest'],
+    ];
+}
+
+add_action('rest_api_init', function () {
+    register_rest_route('xen/v1', '/users/find-by-subscr-id', [
+        'methods'             => 'GET',
+        'permission_callback' => function () { return current_user_can('list_users'); },
+        'args' => [
+            'subscr_id' => ['required' => true,
+                            'description' => 'One profile ID, a comma list, or a JSON array. Max 50.'],
+        ],
+        'callback' => 'xen_users_find_by_subscr_id',
+    ]);
+});
 
 function xen_set_access_resolve_user($ident) {
     $ident = trim((string) $ident);
@@ -1262,6 +1423,48 @@ function xen_users_set_access($request) {
         $old_eot = get_user_meta($u->ID, $eot_key, true);
         $old_role = !empty($u->roles) ? (string) reset($u->roles) : '';
 
+        // --- subscription identity ------------------------------------------
+        // s2Member CLEARS these on demotion, so restoring access after a
+        // resolved chargeback leaves the member unidentifiable from a gateway
+        // notice. Verified 2026-08-03: users 7367 and 9412 have neither key.
+        $sid_key = $wpdb->base_prefix . 's2member_subscr_id';
+        $gw_key  = $wpdb->base_prefix . 's2member_subscr_gateway';
+        $old_sid = get_user_meta($u->ID, $sid_key, true);
+        $old_gw  = get_user_meta($u->ID, $gw_key, true);
+
+        $want_sid = array_key_exists('subscr_id', $row) ? $row['subscr_id'] : $request->get_param('subscr_id');
+        $want_gw  = array_key_exists('subscr_gateway', $row) ? $row['subscr_gateway'] : $request->get_param('subscr_gateway');
+
+        $new_sid = null; $sid_clear = false;
+        if ($want_sid !== null && $want_sid !== '') {
+            if (strtolower(trim((string) $want_sid)) === 'clear') {
+                $sid_clear = true; $new_sid = '';
+            } else {
+                $new_sid = trim((string) $want_sid);
+            }
+        }
+        $new_gw = null; $gw_clear = false;
+        if ($want_gw !== null && $want_gw !== '') {
+            if (strtolower(trim((string) $want_gw)) === 'clear') {
+                $gw_clear = true; $new_gw = '';
+            } else {
+                $new_gw = strtolower(trim((string) $want_gw));
+                if (!in_array($new_gw, ['paypal', 'stripe', 'free', 'manual'], true)) {
+                    $plans[] = ['identifier' => $ident, 'user_id' => $u->ID, 'status' => 'invalid_gateway'];
+                    $fatal[] = "row {$i}: subscr_gateway '{$want_gw}' is not one of paypal, stripe, free, manual.";
+                    continue;
+                }
+            }
+        }
+        // Writing an ID without naming the gateway leaves s2Member guessing how
+        // to interpret it. Require the pair.
+        if ($new_sid !== null && !$sid_clear && $new_gw === null && $old_gw === '') {
+            $plans[] = ['identifier' => $ident, 'user_id' => $u->ID, 'status' => 'gateway_required'];
+            $fatal[] = "row {$i}: subscr_id supplied but no subscr_gateway, and none is stored. "
+                     . 'Pass subscr_gateway so s2Member knows how to read the ID.';
+            continue;
+        }
+
         $blobs = [];
         foreach (xen_set_access_cap_keys($u->ID) as $ck) {
             $caps = maybe_unserialize(get_user_meta($u->ID, $ck, true));
@@ -1278,6 +1481,8 @@ function xen_users_set_access($request) {
 
         $role_changes = ($new_role !== null && $new_role !== $old_role);
         $eot_changes  = !empty($eot['skip']) ? false : ((string) $old_eot !== (string) $eot['value']);
+        $sid_changes  = ($new_sid !== null) && ((string) $old_sid !== (string) $new_sid);
+        $gw_changes   = ($new_gw !== null)  && ((string) $old_gw  !== (string) $new_gw);
 
         $plans[] = [
             'identifier'      => $ident,
@@ -1290,15 +1495,26 @@ function xen_users_set_access($request) {
             'new_auto_eot'    => !empty($eot['skip']) ? ($old_eot === '' ? null : $old_eot)
                                                       : ($eot['value'] === '' ? null : $eot['value']),
             'auto_eot_source' => $how,
+            'old_subscr_id'      => $old_sid === '' ? null : $old_sid,
+            'new_subscr_id'      => $new_sid === null ? ($old_sid === '' ? null : $old_sid)
+                                                      : ($new_sid === '' ? null : $new_sid),
+            'old_subscr_gateway' => $old_gw === '' ? null : $old_gw,
+            'new_subscr_gateway' => $new_gw === null ? ($old_gw === '' ? null : $old_gw)
+                                                     : ($new_gw === '' ? null : $new_gw),
             'ccaps_before'    => $ccaps_before,
             'ccaps_after'     => $preserve_ccaps ? $ccaps_before : [],
             'flat_ccaps_meta' => get_user_meta($u->ID, 'ccaps', true) ?: null,
             'capability_blobs'=> array_keys($blobs),
-            'status'          => ($role_changes || $eot_changes) ? 'would_change' : 'already_set',
+            'status'          => ($role_changes || $eot_changes || $sid_changes || $gw_changes)
+                                    ? 'would_change' : 'already_set',
             '_apply' => [
                 'role'      => $role_changes ? $new_role : null,
                 'eot'       => $eot_changes ? $eot['value'] : null,
                 'eot_clear' => !empty($eot['clear']),
+                'sid'       => $sid_changes ? $new_sid : null,
+                'sid_clear' => $sid_clear,
+                'gw'        => $gw_changes ? $new_gw : null,
+                'gw_clear'  => $gw_clear,
                 'blobs'     => $blobs,
             ],
         ];
@@ -1379,6 +1595,25 @@ function xen_users_set_access($request) {
             }
         }
 
+        // --- subscription identity -----------------------------------------
+        // Base prefix only. Verified 2026-08-03: s2Member does NOT mirror
+        // subscr_id/gateway to the wp_N_ subsite blobs the way it mirrors
+        // capabilities and access_cap_times — user 9412's record carries
+        // wp_2_/wp_3_/wp_4_s2member_access_cap_times but no subsite subscr key.
+        // Writing subsite copies would invent state s2Member never creates.
+        $sid_key = $wpdb->base_prefix . 's2member_subscr_id';
+        $gw_key  = $wpdb->base_prefix . 's2member_subscr_gateway';
+        if ($apply['sid_clear']) {
+            delete_user_meta($uid, $sid_key);
+        } elseif ($apply['sid'] !== null) {
+            update_user_meta($uid, $sid_key, $apply['sid']);
+        }
+        if ($apply['gw_clear']) {
+            delete_user_meta($uid, $gw_key);
+        } elseif ($apply['gw'] !== null) {
+            update_user_meta($uid, $gw_key, $apply['gw']);
+        }
+
         // --- audit: s2Member notes + our own key, both APPEND --------------
         $stamp = gmdate('c');
         $note_key = $wpdb->base_prefix . 's2member_notes';
@@ -1416,6 +1651,17 @@ function xen_users_set_access($request) {
         }
         $now_ccaps = array_values(array_unique($now_ccaps));
 
+        $now_sid = get_user_meta($uid, $sid_key, true);
+        $now_gw  = get_user_meta($uid, $gw_key, true);
+        $sid_ok = true;
+        if ($apply['sid_clear'])        { $sid_ok = ($now_sid === '' || $now_sid === false); }
+        elseif ($apply['sid'] !== null) { $sid_ok = ((string) $now_sid === (string) $apply['sid']); }
+        $gw_ok = true;
+        if ($apply['gw_clear'])        { $gw_ok = ($now_gw === '' || $now_gw === false); }
+        elseif ($apply['gw'] !== null) { $gw_ok = ((string) $now_gw === (string) $apply['gw']); }
+        $p['new_subscr_id']      = ($now_sid === '' || $now_sid === false) ? null : $now_sid;
+        $p['new_subscr_gateway'] = ($now_gw === '' || $now_gw === false) ? null : $now_gw;
+
         $role_ok = ($apply['role'] === null) || ($now_role === $apply['role']);
         $eot_ok  = true;
         if ($apply['eot_clear']) {
@@ -1429,7 +1675,8 @@ function xen_users_set_access($request) {
         $p['new_auto_eot'] = ($now_eot === '' || $now_eot === false) ? null : $now_eot;
         $p['ccaps_after']  = $now_ccaps;
         $p['flat_ccaps_meta_after'] = get_user_meta($uid, 'ccaps', true) ?: null;
-        $p['status'] = ($role_ok && $eot_ok && $ccap_ok) ? 'applied' : 'write_unconfirmed';
+        $p['status'] = ($role_ok && $eot_ok && $ccap_ok && $sid_ok && $gw_ok)
+                        ? 'applied' : 'write_unconfirmed';
 
         if (!$ccap_ok) {
             $result['warnings'][] = "user {$uid}: ccaps went from "
@@ -1465,6 +1712,10 @@ add_action('rest_api_init', function () {
             'users'    => ['required' => false, 'description' => 'Batch: array of {identifier, level?, auto_eot?}.'],
             'level'    => ['required' => false, 'description' => '0-5, a role slug, or "demoted". Batch default.'],
             'auto_eot' => ['required' => false, 'description' => 'YYYY-MM-DD, unix seconds, or "clear". Batch default.'],
+            'subscr_id'      => ['required' => false,
+                                 'description' => 'Gateway subscription/profile ID, or "clear". s2Member wipes this on demotion; restoring it makes the member findable from a gateway notice again.'],
+            'subscr_gateway' => ['required' => false,
+                                 'description' => 'paypal | stripe | free | manual, or "clear". Required alongside subscr_id when none is stored.'],
             'preserve_ccaps' => ['default' => true, 'type' => 'boolean'],
             'dry_run'        => ['default' => true, 'type' => 'boolean'],
             'allow_partial'  => ['default' => false, 'type' => 'boolean'],
