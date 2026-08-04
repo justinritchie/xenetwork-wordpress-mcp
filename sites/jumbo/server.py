@@ -1676,6 +1676,264 @@ async def get_content(
 # <<< gated-content-read (managed by claude) <<<
 
 
+_INVENTORY_MIN_VERSION = (2, 9, 0)
+_INVENTORY_WRITE_MIN_VERSION = (2, 10, 0)
+_ACF_OPTIONS_MIN_VERSION = (2, 11, 0)
+
+
+async def _jq_gate(site_name: str, minimum: tuple, what: str):
+    """Resolve a site and confirm its mu-plugin is new enough.
+
+    Returns (site, None) on success or (None, error_dict). Factored out because
+    four tools repeat it, and because the 404 a too-old site returns is
+    indistinguishable from a routing bug without it.
+    """
+    try:
+        s = _resolve_site(site_name)
+    except ValueError as e:
+        return None, {"ok": False, "error": str(e)}
+
+    raw, parsed, err = await _jq_version(s)
+    if err:
+        return None, {"ok": False, "site": s.name, "error": err,
+                      "hint": "Is jumbo-qa-rest.php deployed on this site?"}
+    if parsed is None or parsed < minimum:
+        want = ".".join(str(n) for n in minimum)
+        return None, {
+            "ok": False, "site": s.name, "error": "plugin_too_old",
+            "installed_version": raw, "required_version": want,
+            "message": f"{s.name} runs jumbo-qa-rest.php {raw!r}; {what} needs {want}+.",
+        }
+    return s, None
+
+
+@mcp.tool(
+    description=(
+        "Read REMAINING SEATS per choice for a GP Inventory field. Read-only.\n"
+        "\n"
+        "USE THIS to answer 'how many Concord seats are left'. The Gravity Forms "
+        "REST API cannot: gf_get_form returns `inventory_limit`, the CONFIGURED "
+        "cap, never the remainder. Remaining is runtime state.\n"
+        "\n"
+        "Do NOT compute this by counting entries. An entry count drifts from what "
+        "the form enforces the moment an entry is deleted, trashed, spam-filtered "
+        "or admin-created. This reads GP Inventory's own accounting — the same "
+        "call the form makes when rendering — so it cannot disagree with what is "
+        "actually enforced.\n"
+        "\n"
+        "Per choice you get `limit`, `claimed`, `remaining`, `is_full` and "
+        "`unlimited`. Read all of them: when limit/claimed/remaining stop "
+        "reconciling, that difference is the bug report.\n"
+        "\n"
+        "Two things this surfaces that the form JSON does not:\n"
+        "  inventory_enforced=false — GP Inventory writes a default "
+        "inventory_limit of 0 onto every choice of every choice field. Without "
+        "gpiInventory on the field those numbers are INERT: the field looks "
+        "configured and enforces nothing.\n"
+        "  unlimited vs a cap of 0 — Gravity Forms treats '0' as a real cap of "
+        "zero (permanently full), not 'unlimited'. They are different states.\n"
+        "\n"
+        "Args:\n"
+        "  site: REQUIRED site name from list_sites.\n"
+        "  form_id: Gravity Forms form ID.\n"
+        "  field_id: omit to return every inventory-enabled field on the form.\n"
+        "  fresh: bypass GP Inventory's result cache. Default True — LEAVE IT ON "
+        "for before/after delta checks, because a cached read after a "
+        "registration shows no movement and makes a working form look broken."
+    ),
+)
+async def get_inventory(
+    site: str, form_id: int, field_id: int | None = None, fresh: bool = True
+) -> dict:
+    s, err = await _jq_gate(site, _INVENTORY_MIN_VERSION, "inventory reads")
+    if err:
+        return err
+
+    params: dict = {"form_id": form_id, "fresh": "1" if fresh else "0"}
+    if field_id is not None:
+        params["field_id"] = field_id
+
+    try:
+        r = await _get_site(s, "/wp-json/jumbo-qa/v1/inventory", params)
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "site": s.name, "error": _err("get_inventory", e)}
+    if isinstance(data, dict):
+        data["site"] = s.name
+    return data
+
+
+@mcp.tool(
+    description=(
+        "Set per-choice inventory caps by choice VALUE. Merge semantics.\n"
+        "\n"
+        "USE THIS instead of gf_update_field for caps. gf_update_field requires "
+        "resending the ENTIRE choices array — every choice's `text` and `value` "
+        "with it. On these forms the text is HTML "
+        "(<span class=\"aar-date\">...) and the value is the routing key for the "
+        "confirmation page, the confirmation email and user meta. A typo in the "
+        "markup breaks layout visibly; a typo in a value breaks confirmation "
+        "routing SILENTLY — the registrant lands on the fallback page and nobody "
+        "notices until a client tests it.\n"
+        "\n"
+        "This merges server-side, so the choices array never crosses the wire. "
+        "text, value, isSelected and price are read from the stored field and "
+        "written back untouched; they are not inputs and cannot be corrupted.\n"
+        "\n"
+        "Errors loudly if a key in `limits` matches no existing choice value, "
+        "rather than returning 200 and enforcing nothing.\n"
+        "\n"
+        "Args:\n"
+        "  site: REQUIRED site name from list_sites.\n"
+        "  form_id / field_id: the choice field.\n"
+        "  limits: keyed by choice VALUE, not the visible label. "
+        "{\"Concord\": 225}. Pass null for unlimited.\n"
+        "  enable: 'simple' or 'advanced' to switch gpiInventory on in the same "
+        "call. REFUSED if any choice would be left holding the default limit of "
+        "0 — Gravity Forms treats 0 as a real cap, so enabling would instantly "
+        "disable those choices on the live form. Include every choice when "
+        "enabling.\n"
+        "  dry_run: return the before/after diff and write nothing."
+    ),
+)
+async def set_inventory_limits(
+    site: str,
+    form_id: int,
+    field_id: int,
+    limits: dict,
+    enable: str | None = None,
+    dry_run: bool = False,
+) -> dict:
+    s, err = await _jq_gate(site, _INVENTORY_WRITE_MIN_VERSION, "inventory writes")
+    if err:
+        return err
+
+    body: dict = {"form_id": form_id, "field_id": field_id,
+                  "limits": limits, "dry_run": bool(dry_run)}
+    if enable:
+        body["enable"] = enable
+
+    try:
+        r = await _post_site(s, "/wp-json/jumbo-qa/v1/inventory/limits", body)
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "site": s.name, "error": _err("set_inventory_limits", e)}
+    if isinstance(data, dict):
+        data["site"] = s.name
+    return data
+
+
+@mcp.tool(
+    description=(
+        "Read an ACF options page — site-wide configuration that lives in ACF, "
+        "not in a SEO plugin. Read-only.\n"
+        "\n"
+        "USE THIS to read or audit Sharing (og:title / og:description / og:image), "
+        "Messaging, Access, Branding, Profiles and the other registered pages. "
+        "Call with no `page` to list what a site actually has — page slugs differ "
+        "between sites and guessing wastes a round trip.\n"
+        "\n"
+        "Field NAMES come from ACF definitions, not from options_* row names, and "
+        "are frequently not what you would guess: the Sharing fields are "
+        "og_title / og_description / og_image, not share_*. Always read before "
+        "writing.\n"
+        "\n"
+        "Image fields resolve to `value_url` plus `value_meta` with width/height, "
+        "so 'is this share card the right 1200x627' is a one-call check rather "
+        "than a media-library visit.\n"
+        "\n"
+        "AUDIT NOTE: this reads INTENT. It does not prove what crawlers receive. "
+        "A page-cached response can serve stale og: tags long after ACF is "
+        "correct — verified on aar-u65, where ACF held the right title while the "
+        "cached page still served the previous event's. To confirm reality, fetch "
+        "the rendered page with a cache-busting query string and compare. The two "
+        "disagreeing IS the bug.\n"
+        "\n"
+        "Args:\n"
+        "  site: REQUIRED site name from list_sites.\n"
+        "  page: options page slug, with or without the 'acf-options-' prefix. "
+        "Omit to list registered pages.\n"
+        "  field: single field name."
+    ),
+)
+async def get_acf_options(
+    site: str, page: str | None = None, field: str | None = None
+) -> dict:
+    s, err = await _jq_gate(site, _ACF_OPTIONS_MIN_VERSION, "ACF options reads")
+    if err:
+        return err
+
+    params: dict = {}
+    if page:
+        params["page"] = page
+    if field:
+        params["field"] = field
+
+    try:
+        r = await _get_site(s, "/wp-json/jumbo-qa/v1/acf-options", params or None)
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "site": s.name, "error": _err("get_acf_options", e)}
+    if isinstance(data, dict):
+        data["site"] = s.name
+    return data
+
+
+@mcp.tool(
+    description=(
+        "Write fields on an ACF options page. Merge semantics — only the named "
+        "fields change, everything else is untouched.\n"
+        "\n"
+        "Call get_acf_options FIRST. Field names come from ACF definitions and "
+        "are often not what you would guess (Sharing is og_title, not "
+        "share_title). An unrecognised name is REFUSED rather than written, "
+        "because writing it would create an orphan options_* row with no "
+        "field-key partner: invisible in wp-admin, present in the database.\n"
+        "\n"
+        "Writes go through ACF by field key, which maintains the `_options_<name>` "
+        "shadow row binding value to definition. Never write these through the "
+        "raw options endpoints — dropping that row leaves the admin screen "
+        "rendering an empty field over a populated database.\n"
+        "\n"
+        "Image fields take an attachment ID.\n"
+        "\n"
+        "dry_run genuinely does not write; it returns the before/after and stops. "
+        "Use it on client sites.\n"
+        "\n"
+        "CACHE: an ACF write does not flush page cache. The rendered og: tags can "
+        "keep serving the old values, and social platforms cache what they fetch, "
+        "so a wrong preview card can outlive the WP cache. After changing sharing "
+        "metadata, verify the rendered page with a cache-busting query string and "
+        "consider re-scraping in each platform's debugger.\n"
+        "\n"
+        "Args:\n"
+        "  site: REQUIRED site name from list_sites.\n"
+        "  page: options page slug.\n"
+        "  fields: {field_name: value}. Only these change.\n"
+        "  dry_run: return the diff and write nothing."
+    ),
+)
+async def set_acf_options(
+    site: str, page: str, fields: dict, dry_run: bool = False
+) -> dict:
+    s, err = await _jq_gate(site, _ACF_OPTIONS_MIN_VERSION, "ACF options writes")
+    if err:
+        return err
+
+    try:
+        r = await _post_site(
+            s,
+            "/wp-json/jumbo-qa/v1/acf-options",
+            {"page": page, "fields": fields, "dry_run": bool(dry_run)},
+        )
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "site": s.name, "error": _err("set_acf_options", e)}
+    if isinstance(data, dict):
+        data["site"] = s.name
+    return data
+
+
 if __name__ == "__main__":
     print(
         f"[wp-jumbo-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",
