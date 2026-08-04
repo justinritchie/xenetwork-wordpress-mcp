@@ -173,16 +173,46 @@ client = httpx.AsyncClient(
 )
 
 
+def _site_join(site: SiteConfig, path: str) -> str:
+    """Join a path onto a site, picking root- vs base-relative correctly.
+
+    Two REST namespaces live on these sites:
+
+        /wp-json/wp/v2/...        core WordPress   -> relative to site.base
+        /wp-json/jumbo-qa/v1/...  our mu-plugin    -> relative to site.url
+
+    Callers used to have to know which helper to reach for, and passing a
+    root-relative path to a base-relative helper produced
+
+        {url}/wp-json/wp/v2  +  /wp-json/jumbo-qa/v1/whoami
+        -> {url}/wp-json/wp/v2/wp-json/jumbo-qa/v1/whoami
+
+    which 404s as `rest_no_route` and reads exactly like an undeployed
+    mu-plugin. That cost a full QA session to track down on Aug 3 2026.
+
+    The disambiguation is structural, not a guess: site.base already ends in
+    /wp-json/wp/v2, so a path that itself starts with /wp-json/ can never be
+    legitimately base-relative — appending it always doubles the segment.
+    Routing on that prefix therefore has no false positives, and any future
+    namespace (/wp-json/gf/v2/..., /wp-json/acf/v3/...) resolves correctly
+    with no new helper and no call-site decision.
+
+    Defined here, above every joiner, so there is exactly one rule. Both the
+    active-site helpers (_get) and the explicit-site helpers (_get_site,
+    _post_site) route through it.
+    """
+    return f"{site.url}{path}" if path.startswith("/wp-json/") else f"{site.base}{path}"
+
+
 def _site_headers() -> dict[str, str]:
     """Auth header for the currently-active site."""
     return {"Authorization": _active().auth_header}
 
 
 async def _get(path: str, params: dict | None = None) -> httpx.Response:
-    """GET <active-site-base>/<path> with the active site's auth."""
+    """GET the active site at <path>. See _site_join for root- vs base-relative."""
     site = _active()
-    url = f"{site.base}{path}"
-    return await client.get(url, params=params, headers=_site_headers())
+    return await client.get(_site_join(site, path), params=params, headers=_site_headers())
 
 
 # ---------------------------------------------------------------------------
@@ -253,10 +283,25 @@ if SITE_LABEL:
 
 def _err(stage: str, exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
-        return (
+        url = str(exc.request.url)
+        msg = (
             f"ERROR ({stage}): HTTP {exc.response.status_code} from "
-            f"{exc.request.url} — {exc.response.text[:300]}"
+            f"{url} — {exc.response.text[:300]}"
         )
+        # A doubled /wp-json/ means we built the URL wrong, not that the site
+        # is missing an endpoint. WordPress answers both cases with an
+        # identical `rest_no_route` 404, so without this the caller's hint
+        # ("is the mu-plugin deployed?") sends the reader after a healthy
+        # plugin. Say which failure this actually is.
+        if url.count("/wp-json/") > 1:
+            msg += (
+                "\n  MALFORMED URL — '/wp-json/' appears more than once. This is a"
+                " client-side path-joining bug, NOT a missing endpoint; the site and"
+                " mu-plugin are probably fine. A root-relative path (/wp-json/ns/v1/x)"
+                " was joined onto a base that already ends in /wp-json/wp/v2."
+                " See _site_join. Ignore any 'is the plugin deployed' hint below."
+            )
+        return msg
     return f"ERROR ({stage}): {type(exc).__name__}: {exc}"
 
 
@@ -842,8 +887,8 @@ def _site_auth(site: SiteConfig) -> dict[str, str]:
 
 
 async def _get_site(site: SiteConfig, path: str, params: dict | None = None) -> httpx.Response:
-    """GET against an EXPLICIT site (not _active())."""
-    return await client.get(f"{site.base}{path}", params=params, headers=_site_auth(site))
+    """GET against an EXPLICIT site (not _active()). See _site_join for path rules."""
+    return await client.get(_site_join(site, path), params=params, headers=_site_auth(site))
 
 
 async def _post_site(
@@ -854,7 +899,7 @@ async def _post_site(
     httpx sets Content-Type: application/json from json=. Returns the final
     response; the caller inspects status (never half-swallows an error).
     """
-    url = f"{site.base}{path}"
+    url = _site_join(site, path)
     headers = _site_auth(site)
     delay = 1.0
     resp: httpx.Response | None = None
