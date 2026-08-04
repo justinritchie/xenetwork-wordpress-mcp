@@ -14,19 +14,32 @@
 # This script is what the launchd plist invokes; also fine to run in foreground for debugging.
 set -euo pipefail
 
+HERE="$(cd "$(dirname "$0")" && pwd)"
+
+# Enumerate sites from disk rather than hardcoding. The old hardcoded
+# "supported: root, ets" went stale the moment jumbo was added, and a wrong
+# list in an error message sends the reader somewhere that does not exist.
+list_sites() {
+  local d
+  for d in "$HERE"/sites/*/server.py; do
+    [[ -f "$d" ]] || continue
+    basename "$(dirname "$d")"
+  done | sort | tr '\n' ' '
+}
+
 if [[ $# -ne 1 ]]; then
-  echo "Usage: $0 <site>     # site = root | ets" >&2
+  echo "Usage: $0 <site>" >&2
+  echo "       available: $(list_sites)" >&2
   exit 64
 fi
 
 SITE="$1"
-HERE="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="${HOME}/.mcp-credentials/wordpress-${SITE}.env"
 SERVER_FILE="$HERE/sites/${SITE}/server.py"
 
 if [[ ! -f "$SERVER_FILE" ]]; then
   echo "ERROR: unknown site '$SITE' — no server at $SERVER_FILE" >&2
-  echo "       supported: root, ets" >&2
+  echo "       available: $(list_sites)" >&2
   exit 64
 fi
 
@@ -34,6 +47,54 @@ if [[ ! -f "$ENV_FILE" ]]; then
   echo "ERROR: credentials not found at $ENV_FILE" >&2
   echo "       create it with WP_BASE_URL, WP_USERNAME, WP_APP_PASSWORD, WP_MCP_PORT" >&2
   exit 65
+fi
+
+# --- Pre-flight lint of the env file -----------------------------------------
+#
+# This MUST run before `source`. A malformed line blows up DURING sourcing, and
+# `set -e` then kills the script instantly — so any validation placed after the
+# source line (see WP_MCP_PORT etc. below) never executes.
+#
+# The failure this catches, which cost a full QA session on Aug 3 2026:
+# a WP Application Password is 24 chars WITH SPACES ("aaaa bbbb cccc ..."). If
+# it is not quoted, bash reads
+#
+#     WP_SITE_FOO_PASSWORD=aaaa bbbb cccc
+#
+# as a one-shot assignment prefix and tries to execute `bbbb` as a command. The
+# result is a bare
+#
+#     wordpress-jumbo.env: line 48: bbbb: command not found
+#
+# and exit 127. launchd reports only the exit code, so the service crash-loops
+# with no usable explanation and the MCP connector just times out.
+#
+# Uses \042 (") and \047 (') so the awk program needs no nested quoting.
+BAD_LINES="$(awk '
+  /^[[:space:]]*#/  { next }                        # comment
+  !/=/              { next }                        # not an assignment
+  {
+    key = substr($0, 1, index($0, "=") - 1)
+    sub(/^[[:space:]]*(export[[:space:]]+)?/, "", key)
+    sub(/[[:space:]]+$/, "", key)
+    if (key !~ /^[A-Za-z_][A-Za-z0-9_]*$/) next     # not a valid var name
+    val = substr($0, index($0, "=") + 1)
+    if (val ~ /^[\042\047]/)                 next   # already quoted — fine
+    if (val ~ /[[:space:]]/) printf "  line %d: %s\n", FNR, key
+  }
+' "$ENV_FILE")"
+
+if [[ -n "$BAD_LINES" ]]; then
+  echo "ERROR: $ENV_FILE has unquoted value(s) containing spaces:" >&2
+  echo "$BAD_LINES" >&2
+  echo >&2
+  echo "       Sourcing this file would fail with 'command not found' and exit 127." >&2
+  echo "       WP Application Passwords contain spaces and MUST be quoted:" >&2
+  echo >&2
+  echo '           WP_SITE_FOO_PASSWORD="aaaa bbbb cccc dddd eeee ffff"' >&2
+  echo >&2
+  echo "       Keep the spaces — they are part of the password. Just add the quotes." >&2
+  exit 66
 fi
 
 # shellcheck disable=SC1090
