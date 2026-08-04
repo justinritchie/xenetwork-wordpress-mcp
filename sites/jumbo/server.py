@@ -1934,6 +1934,214 @@ async def set_acf_options(
     return data
 
 
+_CACHE_PURGE_MIN_VERSION = (2, 12, 0)
+
+# Tags worth diffing between the plain and cache-busted fetch. og:* and
+# twitter:* drive every share preview; title and canonical catch the rest.
+_CRAWLER_TAGS = (
+    "og:title", "og:description", "og:image", "og:url", "og:type", "og:site_name",
+    "twitter:title", "twitter:description", "twitter:image", "twitter:card",
+)
+
+
+def _extract_meta(html: str) -> dict:
+    """Pull <title>, canonical and the social tags out of raw HTML.
+
+    Deliberately regex rather than a parser: this runs against whatever the edge
+    returns, including truncated or malformed responses, and must not raise.
+    Handles both attribute orders — content-before-property is common in
+    hand-rolled theme headers and is easy to miss.
+    """
+    import re
+
+    out: dict = {}
+
+    m = re.search(r"<title[^>]*>([^<]*)</title>", html, re.I)
+    out["title"] = m.group(1).strip() if m else None
+
+    m = re.search(r'<link[^>]+rel=["\']canonical["\'][^>]+href=["\']([^"\']+)', html, re.I)
+    out["canonical"] = m.group(1) if m else None
+
+    for tag in _CRAWLER_TAGS:
+        t = re.escape(tag)
+        m = (re.search(r'(?:property|name)=["\']' + t + r'["\'][^>]*content=["\']([^"\']*)', html, re.I)
+             or re.search(r'content=["\']([^"\']*)["\'][^>]*(?:property|name)=["\']' + t + r'["\']', html, re.I))
+        out[tag] = m.group(1) if m else None
+
+    return out
+
+
+@mcp.tool(
+    description=(
+        "Show what a CRAWLER actually receives for a URL, and whether the public "
+        "surface is stale. Read-only, makes no changes.\n"
+        "\n"
+        "USE THIS after any content, ACF or form change on a live site, and in "
+        "pre-event QA. It answers the question no other tool can: the database "
+        "and wp-admin can both be correct while the public surface serves "
+        "something else entirely.\n"
+        "\n"
+        "Fetches the URL TWICE — the plain URL exactly as a crawler requests it, "
+        "and a cache-busted variant — then diffs the meta tags. Any difference "
+        "means the cached public copy is stale. `stale: true` plus `differs` "
+        "names the fields.\n"
+        "\n"
+        "Reports the cache headers (x-cache, age, cf-cache-status, cache-control). "
+        "`x-cache: HIT` with a large `age` is the single fact that most reliably "
+        "explains 'I saved it and nothing changed'.\n"
+        "\n"
+        "Fetched from THIS MACHINE, not from the web server, deliberately. A "
+        "server requesting its own public URL can take a different path through "
+        "the edge than an outside requester, which would hide the exact failure "
+        "this tool exists to catch.\n"
+        "\n"
+        "Sends a facebookexternalhit user agent by default, so it sees what "
+        "Facebook, LinkedIn, Slack and Teams see.\n"
+        "\n"
+        "KNOWN TRAP: a site root that redirects usually DROPS the query string, "
+        "so the root URL cannot be cache-busted. Point this at the real "
+        "destination (e.g. /access/start/) rather than /.\n"
+        "\n"
+        "Args:\n"
+        "  url: full URL. Use the page a crawler would actually fetch.\n"
+        "  user_agent: override the crawler UA if you need to compare.\n"
+        "  site: optional, for labelling only — the fetch is by URL."
+    ),
+)
+async def get_crawler_view(
+    url: str, user_agent: str | None = None, site: str | None = None
+) -> dict:
+    import uuid
+
+    ua = user_agent or "facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)"
+    sep = "&" if "?" in url else "?"
+    busted = f"{url}{sep}_cachebust={uuid.uuid4().hex[:12]}"
+
+    async def fetch(u: str) -> dict:
+        try:
+            r = await client.get(u, headers={"User-Agent": ua},
+                                 follow_redirects=True, timeout=30.0)
+            return {
+                "ok": True,
+                "status": r.status_code,
+                "final_url": str(r.url),
+                "headers": {
+                    k: v for k, v in r.headers.items()
+                    if k.lower() in (
+                        "x-cache", "age", "cache-control", "cf-cache-status",
+                        "x-cacheable", "x-served-by", "vary", "expires",
+                    )
+                },
+                "meta": _extract_meta(r.text),
+                "bytes": len(r.text),
+            }
+        except Exception as e:
+            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    plain = await fetch(url)
+    fresh = await fetch(busted)
+
+    if not plain.get("ok") or not fresh.get("ok"):
+        return {"ok": False, "url": url, "plain": plain, "cache_busted": fresh,
+                "error": "fetch_failed"}
+
+    differs = [
+        k for k in plain["meta"]
+        if plain["meta"].get(k) != fresh["meta"].get(k)
+    ]
+
+    # The root-redirect trap: if the buster did not survive to the final URL, the
+    # "fresh" fetch is really a second cached fetch and a stale=false result
+    # would be meaningless. Say so rather than reporting a clean bill of health.
+    buster_survived = "_cachebust=" in fresh.get("final_url", "")
+
+    out = {
+        "ok": True,
+        "url": url,
+        "status": plain["status"],
+        "final_url": plain["final_url"],
+        "cache": plain["headers"],
+        "meta": plain["meta"],
+        "stale": bool(differs),
+        "differs": differs,
+        "comparison": {
+            k: {"plain": plain["meta"].get(k), "cache_busted": fresh["meta"].get(k)}
+            for k in differs
+        },
+        "cache_bust_verified": buster_survived,
+    }
+
+    if not buster_survived:
+        out["warning"] = (
+            "The cache-busting query string did NOT survive to the final URL — a redirect "
+            "dropped it, so both fetches may have hit the same cached copy and `stale` is "
+            "not trustworthy here. Request the redirect destination directly."
+        )
+    if differs:
+        out["hint"] = (
+            "The public surface is STALE. Crawlers request the plain URL, so share previews "
+            "and cached visitors are seeing the values under `plain`. Run purge_cache, then "
+            "re-run this."
+        )
+    if site:
+        out["site"] = site
+    return out
+
+
+@mcp.tool(
+    description=(
+        "Purge a Jumbo site's page/object cache, and report WHICH mechanism ran.\n"
+        "\n"
+        "USE THIS after changing anything that renders publicly — ACF options, "
+        "page content, form choices, inventory caps. Saving does not change what "
+        "a crawler or a cached visitor receives until the edge cache clears.\n"
+        "\n"
+        "Returns the mechanisms detected and invoked rather than a bare ok:true. "
+        "If the host offers none it returns supported:false with a reason. A "
+        "purge tool that silently no-ops is worse than none — it turns 'I forgot "
+        "to purge' into 'I purged and it still didn't work', and sends you "
+        "hunting a bug that does not exist.\n"
+        "\n"
+        "Per-URL purge requires WpeCommon::purge_varnish_cache_url, which is NOT "
+        "present on current WP Engine installs here — scope='url' will report "
+        "that rather than pretend. Use scope='all'.\n"
+        "\n"
+        "A PURGE IS NOT PROOF. Always confirm with get_crawler_view against the "
+        "plain URL afterwards. CDN and crawler-side caches are separate again: "
+        "Facebook, LinkedIn and Slack cache what they fetched and may need "
+        "re-scraping in their own debuggers even after this succeeds.\n"
+        "\n"
+        "Args:\n"
+        "  site: REQUIRED site name from list_sites.\n"
+        "  scope: 'all' (default) or 'url'.\n"
+        "  urls: required when scope='url'.\n"
+        "  dry_run: report which mechanisms would fire, purge nothing."
+    ),
+)
+async def purge_cache(
+    site: str,
+    scope: str = "all",
+    urls: list | None = None,
+    dry_run: bool = False,
+) -> dict:
+    s, err = await _jq_gate(site, _CACHE_PURGE_MIN_VERSION, "cache purge")
+    if err:
+        return err
+
+    body: dict = {"scope": scope, "dry_run": bool(dry_run)}
+    if urls:
+        body["urls"] = urls
+
+    try:
+        r = await _post_site(s, "/wp-json/jumbo-qa/v1/cache/purge", body)
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "site": s.name, "error": _err("purge_cache", e)}
+    if isinstance(data, dict):
+        data["site"] = s.name
+    return data
+
+
 if __name__ == "__main__":
     print(
         f"[wp-jumbo-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",
