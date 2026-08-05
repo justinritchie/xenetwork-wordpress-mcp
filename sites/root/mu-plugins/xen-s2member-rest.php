@@ -7,7 +7,7 @@ Description: Surfaces s2Member's user metadata + custom registration fields
              timestamps, gateway IDs, login counts, and custom fields.
              Read-only; only exposes fields when context=edit (auth required).
 Author: Justin Ritchie
-Version: 1.0.0
+Version: 1.1.0
 */
 
 if (!defined('ABSPATH')) {
@@ -1835,3 +1835,340 @@ add_action('rest_api_init', function () {
     ]);
 });
 
+
+/* =============================================================================
+ * ACF options pages — read + write, for EVERY blog in the multisite.
+ *
+ * This file is an mu-plugin, so it loads on the network root AND on /ets
+ * automatically. ACF options resolve against the current blog's own options
+ * table, so the same code serves both:
+ *
+ *     https://xenetwork.org/wp-json/xen/v1/acf-options
+ *     https://xenetwork.org/ets/wp-json/xen/v1/acf-options
+ *
+ * No site parameter is needed or wanted — the URL selects the blog.
+ *
+ * Ported from the wordpress-jumbo implementation rather than rewritten. The
+ * failure modes below are the reason it is a port.
+ *
+ *   1. Writes go through ACF by FIELD KEY. That maintains the `_options_<name>`
+ *      shadow row binding value to field definition. Write the value row alone
+ *      and wp-admin renders an EMPTY FIELD over a populated database — it reads
+ *      back fine over the API, so only a human looking at wp-admin sees it.
+ *   2. An unrecognised field name is refused, never written. Writing it blind
+ *      creates an orphan options_* row with no field-key partner: invisible in
+ *      wp-admin, present in the database, unexplainable later.
+ *   3. Field NAMES come from ACF definitions and are frequently not what the
+ *      admin label suggests. Always read before writing.
+ *
+ * Two additions over the Jumbo version, both specific to this network:
+ *
+ *   - `integrity`: every write is verified by re-reading through ACF, and a
+ *     mismatch is reported as a failure rather than a bare success. Matches the
+ *     shape xen-formidable-rest.php already uses.
+ *   - GUARDED FIELDS: some fields silently change what the public site renders.
+ *     The ETS Announcement Bar's visibility mode is one — writing "draft" or
+ *     "admin" removes the banner from the live site with no other symptom.
+ *     Those are refused unless the caller names them explicitly.
+ * ========================================================================== */
+
+/**
+ * Field names/labels that change public rendering in a way that is invisible
+ * from an API read-back. Matched case-insensitively against BOTH name and label.
+ */
+function xen_acf_guarded_patterns() {
+    return ['/visib/i', '/(^|_)mode($|_)/i', '/enabled$/i', '/^show_/i'];
+}
+
+function xen_acf_is_guarded($field) {
+    foreach (xen_acf_guarded_patterns() as $re) {
+        if (preg_match($re, (string) ($field['name'] ?? '')) ||
+            preg_match($re, (string) ($field['label'] ?? ''))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function xen_acf_pages() {
+    if (!function_exists('acf_get_options_pages')) { return []; }
+    $pages = acf_get_options_pages();
+    if (!is_array($pages)) { return []; }
+
+    $out = [];
+    foreach ($pages as $slug => $p) {
+        $menu  = is_array($p) ? ($p['menu_slug'] ?? $slug) : $slug;
+        $short = preg_replace('/^acf-options-/', '', (string) $menu);
+        $out[$short] = [
+            'slug'      => $short,
+            'menu_slug' => $menu,
+            'title'     => is_array($p) ? ($p['page_title'] ?? $short) : $short,
+            'post_id'   => is_array($p) ? ($p['post_id'] ?? 'option') : 'option',
+        ];
+    }
+    return $out;
+}
+
+function xen_acf_fields_for_page($page) {
+    $groups = acf_get_field_groups(['options_page' => $page['menu_slug']]);
+    $fields = [];
+    foreach ((array) $groups as $g) {
+        foreach ((array) acf_get_fields($g) as $f) { $fields[] = $f; }
+    }
+    return $fields;
+}
+
+function xen_acf_field_payload($f, $post_id) {
+    $value = get_field($f['name'], $post_id, false); // raw: IDs not objects
+
+    $row = [
+        'name'    => $f['name'],
+        'key'     => $f['key'],
+        'type'    => $f['type'],
+        'label'   => $f['label'],
+        'value'   => $value,
+        'guarded' => xen_acf_is_guarded($f),
+    ];
+
+    if (!empty($row['guarded'])) {
+        $row['guard_note'] = 'Changing this can alter what the public site renders '
+                           . 'with no other visible symptom. Writing it requires allow_guarded.';
+    }
+
+    // ACF link fields return url/title/target, not a bare string. Surface the
+    // shape so a caller does not send a string and silently flatten it.
+    if ($f['type'] === 'link') {
+        $row['value_shape'] = 'object: {url, title, target}';
+    }
+
+    // Choice fields: list what is actually accepted, so a caller does not guess
+    // a label where a value is required.
+    if (!empty($f['choices']) && is_array($f['choices'])) {
+        $row['choices'] = $f['choices'];
+    }
+
+    if (in_array($f['type'], ['image', 'file'], true) && !empty($value)) {
+        $att_id = is_array($value) ? ($value['ID'] ?? null) : (int) $value;
+        if ($att_id) {
+            $row['value_url'] = wp_get_attachment_url($att_id) ?: null;
+            $meta = wp_get_attachment_metadata($att_id);
+            $row['value_meta'] = (is_array($meta) && isset($meta['width'], $meta['height']))
+                ? ['width' => (int) $meta['width'], 'height' => (int) $meta['height'],
+                   'mime_type' => get_post_mime_type($att_id) ?: null]
+                : null;
+        }
+    }
+
+    return $row;
+}
+
+function xen_acf_meta() {
+    return [
+        'blog_id'     => get_current_blog_id(),
+        'site'        => get_site_url(),
+        'plugin'      => 'xen-s2member-rest',
+        'acf_version' => defined('ACF_VERSION') ? ACF_VERSION : null,
+    ];
+}
+
+/** GET /xen/v1/acf-options[?page=slug][&field=name] */
+function xen_acf_options_get($req) {
+    if (!class_exists('ACF')) {
+        return new WP_Error('acf_missing', 'ACF is not active on this blog.', ['status' => 501]);
+    }
+
+    $pages = xen_acf_pages();
+    $slug  = $req->get_param('page');
+    $slug  = ($slug === null) ? null : preg_replace('/^acf-options-/', '', sanitize_text_field($slug));
+
+    if ($slug === null || $slug === '') {
+        return [
+            'pages' => array_values($pages),
+            'hint'  => 'Pass ?page=<slug> to read one. Slugs are per-blog — the root and /ets '
+                     . 'have different options pages, and this URL selects the blog.',
+            '_meta' => xen_acf_meta(),
+        ];
+    }
+
+    if (!isset($pages[$slug])) {
+        return new WP_Error('page_not_found', "No ACF options page '{$slug}' on this blog.", [
+            'status' => 404, 'available' => array_keys($pages), 'blog_id' => get_current_blog_id(),
+        ]);
+    }
+
+    $page   = $pages[$slug];
+    $only   = $req->get_param('field');
+    $fields = xen_acf_fields_for_page($page);
+
+    $out = [];
+    foreach ($fields as $f) {
+        if ($only && $f['name'] !== $only) { continue; }
+        $out[] = xen_acf_field_payload($f, $page['post_id']);
+    }
+
+    if ($only && empty($out)) {
+        return new WP_Error('field_not_found', "Field '{$only}' is not on '{$slug}'.", [
+            'status' => 404,
+            'available' => array_map(function ($f) { return $f['name']; }, $fields),
+        ]);
+    }
+
+    return ['page' => $slug, 'title' => $page['title'], 'fields' => $out, '_meta' => xen_acf_meta()];
+}
+
+/** POST /xen/v1/acf-options  { page, fields{}, dry_run, allow_guarded[] } */
+function xen_acf_options_set($req) {
+    if (!class_exists('ACF')) {
+        return new WP_Error('acf_missing', 'ACF is not active on this blog.', ['status' => 501]);
+    }
+
+    $slug     = preg_replace('/^acf-options-/', '', sanitize_text_field((string) $req->get_param('page')));
+    $updates  = $req->get_param('fields');
+    $dry_run  = filter_var($req->get_param('dry_run'), FILTER_VALIDATE_BOOLEAN);
+    $allowed  = $req->get_param('allow_guarded');
+    $allowed  = is_array($allowed) ? array_map('strval', $allowed) : [];
+
+    if (!is_array($updates) || empty($updates)) {
+        return new WP_Error('bad_fields', 'fields must be a non-empty object keyed by field name.', ['status' => 400]);
+    }
+
+    $pages = xen_acf_pages();
+    if (!isset($pages[$slug])) {
+        return new WP_Error('page_not_found', "No ACF options page '{$slug}' on this blog.", [
+            'status' => 404, 'available' => array_keys($pages),
+        ]);
+    }
+
+    $page   = $pages[$slug];
+    $fields = xen_acf_fields_for_page($page);
+    $by_name = [];
+    foreach ($fields as $f) { $by_name[$f['name']] = $f; }
+
+    $unknown = array_values(array_diff(array_keys($updates), array_keys($by_name)));
+    if (!empty($unknown)) {
+        return new WP_Error('unknown_field', 'These field name(s) are not on this options page.', [
+            'status'    => 400,
+            'unknown'   => $unknown,
+            'available' => array_keys($by_name),
+            'hint'      => 'Names come from ACF definitions, not admin labels and not options_* rows. '
+                         . 'GET this page first.',
+        ]);
+    }
+
+    // Guarded fields must be named explicitly. This exists because writing the
+    // Announcement Bar's visibility mode to "draft" removes the banner from the
+    // public site and looks like a successful write from every API angle.
+    $guard_hits = [];
+    foreach (array_keys($updates) as $n) {
+        if (xen_acf_is_guarded($by_name[$n]) && !in_array($n, $allowed, true)) {
+            $guard_hits[] = $n;
+        }
+    }
+    if (!empty($guard_hits)) {
+        return new WP_Error('guarded_field', 'These field(s) can silently change what the public site renders.', [
+            'status'  => 409,
+            'guarded' => $guard_hits,
+            'hint'    => 'If you really mean it, pass allow_guarded: ["' . implode('","', $guard_hits) . '"]. '
+                       . 'Read the current value first — an API read-back cannot tell you the banner vanished.',
+        ]);
+    }
+
+    $before = [];
+    foreach ($updates as $name => $_) {
+        $before[$name] = get_field($name, $page['post_id'], false);
+    }
+
+    if ($dry_run) {
+        return [
+            'ok' => true, 'dry_run' => true, 'persisted' => false,
+            'page' => $slug,
+            'changes' => ['before' => $before, 'after' => $updates],
+            'note'  => 'DRY RUN — nothing written. Re-send with dry_run=false to apply.',
+            '_meta' => xen_acf_meta(),
+        ];
+    }
+
+    $write_ok = [];
+    foreach ($updates as $name => $new) {
+        // By KEY — maintains the _options_<name> shadow row. See the header.
+        $write_ok[$name] = (bool) update_field($by_name[$name]['key'], $new, $page['post_id']);
+    }
+
+    // ---- integrity: verify by re-reading through ACF, never trust the write --
+    $after = [];
+    foreach ($updates as $name => $_) {
+        $after[$name] = get_field($name, $page['post_id'], false);
+    }
+
+    $mismatched = [];
+    foreach ($updates as $name => $want) {
+        // Loose compare: ACF normalises some types (ints, link arrays) on save.
+        if (is_scalar($want) && is_scalar($after[$name])) {
+            if ((string) $want !== (string) $after[$name]) { $mismatched[] = $name; }
+        } elseif ($want != $after[$name]) {
+            $mismatched[] = $name;
+        }
+    }
+
+    // The shadow row is the thing that silently breaks. Confirm it exists for
+    // every field written — this is what an API read-back alone cannot prove.
+    $shadow_ok = [];
+    foreach ($updates as $name => $_) {
+        $shadow_ok[$name] = (get_option('_options_' . $name, null) !== null);
+    }
+
+    $result = [
+        'ok'        => empty($mismatched) && !in_array(false, $shadow_ok, true),
+        'dry_run'   => false,
+        'persisted' => true,
+        'page'      => $slug,
+        'changes'   => ['before' => $before, 'after' => $after],
+        'integrity' => [
+            'write_returned_true'  => $write_ok,
+            'verified_by_reread'   => empty($mismatched),
+            'mismatched_fields'    => $mismatched,
+            'field_key_row_present' => $shadow_ok,
+        ],
+        '_meta' => xen_acf_meta(),
+    ];
+
+    if (!empty($mismatched)) {
+        $result['ATTENTION'] = 'Wrote, but the re-read does not match what was sent for: '
+                             . implode(', ', $mismatched) . '. Do not assume this landed.';
+    }
+    if (in_array(false, $shadow_ok, true)) {
+        $result['ATTENTION'] = 'A _options_<name> field-key row is MISSING. wp-admin may now render '
+                             . 'this field EMPTY over a populated database. Check wp-admin before trusting.';
+    }
+    if ($result['ok']) {
+        $result['note'] = 'Verified by re-read. An ACF write does NOT flush page cache — if this '
+                        . 'renders publicly, confirm with a cache-busting query string.';
+    }
+
+    return $result;
+}
+
+add_action('rest_api_init', function () {
+    register_rest_route('xen/v1', '/acf-options', [
+        [
+            'methods'             => 'GET',
+            'permission_callback' => function () { return current_user_can('manage_options'); },
+            'args' => [
+                'page'  => ['type' => 'string', 'description' => 'Options page slug, with or without the acf-options- prefix. Omit to list this blog\'s pages.'],
+                'field' => ['type' => 'string'],
+            ],
+            'callback' => 'xen_acf_options_get',
+        ],
+        [
+            'methods'             => 'POST',
+            'permission_callback' => function () { return current_user_can('manage_options'); },
+            'args' => [
+                'page'          => ['required' => true, 'type' => 'string'],
+                'fields'        => ['required' => true, 'type' => 'object', 'description' => 'Keyed by ACF field NAME. Merge semantics.'],
+                'dry_run'       => ['type' => 'boolean', 'default' => false],
+                'allow_guarded' => ['type' => 'array', 'description' => 'Field names you explicitly accept writing despite the guard.'],
+            ],
+            'callback' => 'xen_acf_options_set',
+        ],
+    ]);
+});

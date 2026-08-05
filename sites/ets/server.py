@@ -1527,6 +1527,137 @@ async def get_activity_log_retention() -> dict | str:
     return await _ets_route("/activity-log/retention", {})
 
 
+
+# --- ACF options pages -------------------------------------------------------
+# This connector is already scoped to one blog (WP_BASE), so these tools need no
+# `site` parameter — the URL selects the blog. The identical block lives in the
+# root and ets servers; each talks to its own blog's options table. Root is
+# blog_id 1, /ets is blog_id 2, and both expose a `site-general-settings` page
+# with the SAME slug and DIFFERENT values. Do not assume a value read on one
+# applies to the other.
+
+
+@mcp.tool(
+    description=(
+        "Read an ACF options page on this blog — site-wide settings that live in "
+        "ACF rather than in a plugin's own tables. Read-only.\n"
+        "\n"
+        "Call with no `page` to list the options pages registered on this blog. "
+        "Do that first: slugs and field names are per-blog and are NOT guessable "
+        "from the admin labels.\n"
+        "\n"
+        "Field NAMES come from ACF definitions, not from the admin label and not "
+        "from options_* row names. On the ETS blog the Announcement Bar's "
+        "'Content' field is `bar_content`, and 'Visibility Mode' is "
+        "`bar_visibility_mode`. Always read before writing.\n"
+        "\n"
+        "Fields that can silently change what the public site renders are marked "
+        "`guarded: true` — writing them needs an explicit opt-in. On ETS that is "
+        "bar_visibility_mode (setting it to draft/admin-only removes the banner "
+        "from the live site) and show_full_episode_feeds_to_non-members (which "
+        "has revenue consequences).\n"
+        "\n"
+        "Link fields return an object {url, title, target}, not a string. Choice "
+        "fields list their accepted `choices` — send the VALUE, not the label. "
+        "Image fields resolve to value_url plus value_meta width/height.\n"
+        "\n"
+        "AUDIT NOTE: this reads INTENT, not what a visitor receives. Page cache "
+        "can serve old markup long after ACF is correct — measured on this exact "
+        "network, where bar_content held the corrected copy while the rendered "
+        "banner still showed the previous wording. To confirm reality, fetch the "
+        "page with a cache-busting query string and compare.\n"
+        "\n"
+        "Args:\n"
+        "  page: options page slug, with or without the 'acf-options-' prefix.\n"
+        "  field: single field name."
+    ),
+)
+async def get_acf_options(page: str | None = None, field: str | None = None) -> dict:
+    params: dict = {}
+    if page:
+        params["page"] = page
+    if field:
+        params["field"] = field
+    try:
+        r = await client.get(f"{WP_BASE}/wp-json/xen/v1/acf-options", params=params or None)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": _err("get_acf_options", e),
+                "hint": "Is xen-s2member-rest.php 1.1.0+ deployed, and is ACF active on this blog?"}
+
+
+@mcp.tool(
+    description=(
+        "Write fields on an ACF options page on this blog. Merge semantics — only "
+        "the named fields change, everything else is untouched.\n"
+        "\n"
+        "CALL get_acf_options FIRST. An unrecognised field name is REFUSED rather "
+        "than written: writing it blind would create an orphan options_* row with "
+        "no field-key partner, invisible in wp-admin but present in the database.\n"
+        "\n"
+        "Writes go through ACF by field KEY, which maintains the `_options_<name>` "
+        "shadow row binding value to definition. Writing the value row alone "
+        "leaves wp-admin rendering an EMPTY FIELD over a populated database — and "
+        "that state reads back fine over this API, so the response cannot tell "
+        "you. The returned `integrity` block re-reads every field and confirms "
+        "the shadow row exists; check it rather than trusting `ok`.\n"
+        "\n"
+        "GUARDED FIELDS are refused unless named in allow_guarded. These change "
+        "public rendering with no other symptom — bar_visibility_mode removes the "
+        "announcement banner from the live site, and "
+        "show_full_episode_feeds_to_non-members affects paid content access. Read "
+        "the current value before overriding the guard.\n"
+        "\n"
+        "KNOWN TRAP on the ETS blog: two distinct fields are both named "
+        "`bar_text_color` (bar text and button text, different keys, identical "
+        "labels). A write by that name is ambiguous and ACF will resolve only "
+        "one. Fix the duplicate in ACF rather than working around it here.\n"
+        "\n"
+        "dry_run genuinely does not write — it returns before/after and stops.\n"
+        "\n"
+        "CACHE: an ACF write does not flush page cache. The rendered page can "
+        "keep serving the old value. Verify with a cache-busting query string, "
+        "and purge if the change needs to be live now.\n"
+        "\n"
+        "Args:\n"
+        "  page: options page slug.\n"
+        "  fields: {field_name: value}. Only these change.\n"
+        "  dry_run: return the diff and write nothing.\n"
+        "  allow_guarded: field names you explicitly accept writing despite the guard."
+    ),
+)
+async def set_acf_options(
+    page: str,
+    fields: dict,
+    dry_run: bool = False,
+    allow_guarded: list | None = None,
+) -> dict:
+    body: dict = {"page": page, "fields": fields, "dry_run": bool(dry_run)}
+    if allow_guarded:
+        body["allow_guarded"] = allow_guarded
+    try:
+        r = await client.post(f"{WP_BASE}/wp-json/xen/v1/acf-options", json=body)
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "error": _err("set_acf_options", e)}
+
+    # Surface integrity problems at the top level. A caller skimming for `ok`
+    # should not have to dig into a nested block to learn the write did not land.
+    if isinstance(data, dict):
+        ig = data.get("integrity") or {}
+        if ig.get("mismatched_fields"):
+            data["ATTENTION"] = (
+                "Re-read does not match what was sent for: "
+                + ", ".join(ig["mismatched_fields"]) + ". Do not assume this landed."
+            )
+        elif False in (ig.get("field_key_row_present") or {}).values():
+            data["ATTENTION"] = (
+                "A _options_<name> field-key row is MISSING — wp-admin may render this "
+                "field EMPTY over a populated database. Check wp-admin, not just the API."
+            )
+    return data
+
 if __name__ == "__main__":
     print(
         f"[wp-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",
