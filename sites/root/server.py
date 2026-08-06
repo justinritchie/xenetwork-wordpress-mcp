@@ -1799,6 +1799,99 @@ async def set_acf_options(
             )
     return data
 
+
+@mcp.tool(
+    description=(
+        "Create the paired WELCOME PAGE for an institutional registration page, "
+        "and repoint that IR page at it.\n"
+        "\n"
+        "WHY THIS EXISTS: duplicate_institutional clones the IR page but leaves "
+        "`welcome_page` meta pointing at the SOURCE org's welcome page, so the "
+        "post-registration redirect lands on another organisation's welcome "
+        "screen. This creates the org its own and fixes the pointer.\n"
+        "\n"
+        "USE THIS for an IR page that ALREADY EXISTS. New builds get it "
+        "automatically — duplicate_institutional now clones the welcome page in "
+        "the same call unless you pass duplicate_welcome_page=False.\n"
+        "\n"
+        "Idempotent: if welcome_page already points at a page whose slug matches "
+        "the IR slug, it returns that page and creates nothing.\n"
+        "\n"
+        "WHAT ACTUALLY GETS COPIED: a welcome page's post_content is only the "
+        "org-specific intro paragraph (~370 chars). The 'Get started' 4-step "
+        "list, the Vimeo walkthrough and every standard link come from the THEME "
+        "TEMPLATE, not the post — so they survive unconditionally and there is "
+        "nothing to preserve. All postmeta and taxonomies are copied too.\n"
+        "\n"
+        "THE ORG LOGO lives in postmeta, not content, and cannot be derived. It "
+        "is copied from the source, so the new page shows the SOURCE org's image "
+        "until a human swaps it in wp-admin. The response says so.\n"
+        "\n"
+        "REPLACEMENTS: the full org name is substituted automatically (source "
+        "title vs the new institution_name). The SHORT form cannot be derived — "
+        "pass it explicitly, e.g. {\"RMI\": \"UL\"}. Anything still naming the "
+        "source org after substitution is reported in residual_source_mentions "
+        "rather than silently shipped.\n"
+        "\n"
+        "Both pages stay DRAFT. Nothing is published automatically.\n"
+        "\n"
+        "Args:\n"
+        "  ir_id: the institutional post that needs its own welcome page.\n"
+        "  replacements: extra find/replace, needed for the short org name.\n"
+        "  welcome_slug: defaults to the IR post's slug, which is what the "
+        "s2Member success= URL already points at — override only if you know "
+        "the success URL differs.\n"
+        "  institution_name: defaults to institution_name meta, else the IR "
+        "title minus the 'Registration - ' prefix.\n"
+        "  source_welcome_id: override the source; defaults to the IR page's "
+        "current welcome_page meta.\n"
+        "  status: defaults to the IR post's own status.\n"
+        "  dry_run: return what would be created, write nothing."
+    ),
+)
+async def create_welcome_page(
+    ir_id: int,
+    replacements: ObjParam = None,
+    welcome_slug: str | None = None,
+    institution_name: str | None = None,
+    source_welcome_id: int | None = None,
+    status: str | None = None,
+    dry_run: bool = False,
+) -> dict | str:
+    body: dict = {"dry_run": bool(dry_run)}
+    if replacements:
+        body["replacements"] = replacements
+    if welcome_slug:
+        body["welcome_slug"] = welcome_slug
+    if institution_name:
+        body["institution_name"] = institution_name
+    if source_welcome_id:
+        body["source_welcome_id"] = source_welcome_id
+    if status:
+        body["status"] = status
+
+    try:
+        r = await client.post(
+            f"{WP_BASE}/wp-json/xen/v1/institutional/{ir_id}/welcome-page", json=body
+        )
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "error": _err("create_welcome_page", e),
+                "hint": "Is xen-s2member-rest.php 1.2.0+ deployed?"}
+
+    # Surface the two things that make a welcome page wrong in a way that looks
+    # fine: residual source-org mentions, and a slug that did not land as asked
+    # (which silently breaks the success= redirect the IR page already carries).
+    if isinstance(data, dict) and not data.get("dry_run"):
+        if data.get("residual_source_mentions"):
+            data.setdefault("ATTENTION", "")
+        if data.get("welcome_slug") and welcome_slug and data["welcome_slug"] != welcome_slug:
+            data["ATTENTION"] = (
+                f"Slug landed as {data['welcome_slug']!r}, not {welcome_slug!r} — the IR page's "
+                "success= URL will not match. Fix before publishing."
+            )
+    return data
+
 if __name__ == "__main__":
     print(
         f"[wp-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",

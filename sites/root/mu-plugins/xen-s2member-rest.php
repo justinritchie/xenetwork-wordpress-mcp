@@ -7,7 +7,7 @@ Description: Surfaces s2Member's user metadata + custom registration fields
              timestamps, gateway IDs, login counts, and custom fields.
              Read-only; only exposes fields when context=edit (auth required).
 Author: Justin Ritchie
-Version: 1.1.0
+Version: 1.2.0
 */
 
 if (!defined('ABSPATH')) {
@@ -280,9 +280,36 @@ add_action('rest_api_init', function () {
 
             $final_slug = get_post_field('post_name', $new_id);
 
+            // Clone the paired welcome page too. The two are always created
+            // together, and leaving welcome_page pointing at the SOURCE org's
+            // page shipped a post-registration redirect to another
+            // organisation's welcome screen. Defaults ON for that reason;
+            // pass duplicate_welcome_page=false for the old behaviour.
+            $welcome = null;
+            $dup_welcome = $req->get_param('duplicate_welcome_page');
+            $dup_welcome = ($dup_welcome === null) ? true : filter_var($dup_welcome, FILTER_VALIDATE_BOOLEAN);
+            if ($dup_welcome && function_exists('xen_clone_welcome_for_ir')) {
+                $welcome = xen_clone_welcome_for_ir($new_id, [
+                    'welcome_slug'     => $req->get_param('welcome_slug') ?: $final_slug,
+                    'institution_name' => $meta_overrides['institution_name'] ?? null,
+                    // The IR page's content_replacements carry the org-name swaps
+                    // already; reuse them so the caller states it once.
+                    'replacements'     => $content_replacements + (array) ($req->get_param('welcome_replacements') ?: []),
+                    'status'           => $status,
+                ]);
+                if (is_wp_error($welcome)) {
+                    $welcome = ['ok' => false, 'error' => $welcome->get_error_code(),
+                                'message' => $welcome->get_error_message()];
+                }
+            }
+
             return [
                 'ok'                  => true,
                 'new_id'              => $new_id,
+                'welcome'             => $welcome,
+                'welcome_page_id'     => is_array($welcome) ? ($welcome['welcome_page_id'] ?? null) : null,
+                'welcome_slug'        => is_array($welcome) ? ($welcome['welcome_slug'] ?? null) : null,
+                'welcome_permalink'   => is_array($welcome) ? ($welcome['welcome_permalink'] ?? null) : null,
                 'new_slug'            => $final_slug,
                 'status'               => get_post_status($new_id),
                 'title'                => get_the_title($new_id),
@@ -2170,5 +2197,226 @@ add_action('rest_api_init', function () {
             ],
             'callback' => 'xen_acf_options_set',
         ],
+    ]);
+});
+
+/* =============================================================================
+ * Welcome-page cloning for institutional registration pages.
+ *
+ * Every IR page has a paired `xen_welcome_page` — the post-registration
+ * destination. duplicate_institutional cloned the IR page but left
+ * `welcome_page` meta pointing at the SOURCE org's welcome page, so the new
+ * portal's success redirect landed on another organisation's page.
+ *
+ * WHAT A WELCOME PAGE ACTUALLY IS (inspected on RMI, post 2476)
+ * post_content is ~371 characters: the org-specific intro paragraph and
+ * nothing else. The "Get started" 4-step list, the Vimeo walkthrough and every
+ * standard link (/login-ets/, /manage-subscription-ets/, /ets/your-subscription/)
+ * come from the THEME TEMPLATE, not the post. They therefore survive any clone
+ * unconditionally — there is nothing to preserve and nothing that can break.
+ * The ticket's acceptance test 3 is satisfied by construction.
+ *
+ * So the clone is: copy 371 chars, swap the org names, copy all postmeta.
+ *
+ * TWO ENTRY POINTS, deliberately
+ *   POST /institutional/<id>/welcome-page   clone a welcome page for an
+ *                                           IR post that ALREADY exists
+ *   duplicate_institutional(duplicate_welcome_page=true)  does it inline
+ *
+ * The standalone route exists because the first real case (UL, post 3817) was
+ * already cloned before this shipped. A create-only implementation would have
+ * forced a re-clone of a page someone had already checked over.
+ * ========================================================================== */
+
+/**
+ * Clone the welcome page currently referenced by an IR post, and repoint that
+ * IR post at the copy.
+ *
+ * @param int   $ir_id  the institutional post that should get its own welcome page
+ * @param array $opts   welcome_slug, institution_name, replacements, status, dry_run
+ * @return array|WP_Error
+ */
+function xen_clone_welcome_for_ir($ir_id, $opts = []) {
+    $ir = get_post($ir_id);
+    if (!$ir || $ir->post_type !== 'xen_institutional') {
+        return new WP_Error('not_found', "Institutional post {$ir_id} not found", ['status' => 404]);
+    }
+
+    $source_welcome_id = (int) get_post_meta($ir_id, 'welcome_page', true);
+    if (!$source_welcome_id) {
+        return new WP_Error('no_welcome_page', "IR post {$ir_id} has no welcome_page meta to clone from.", [
+            'status' => 400,
+            'hint'   => 'Set welcome_page to a source welcome post first, or pass source_welcome_id.',
+        ]);
+    }
+    if (!empty($opts['source_welcome_id'])) {
+        $source_welcome_id = (int) $opts['source_welcome_id'];
+    }
+
+    $src = get_post($source_welcome_id);
+    if (!$src || $src->post_type !== 'xen_welcome_page') {
+        return new WP_Error('bad_source', "Post {$source_welcome_id} is not a xen_welcome_page.", ['status' => 400]);
+    }
+
+    // Guard against re-running: if welcome_page already points at a page whose
+    // slug matches this IR's slug, it has already been cloned. Returning the
+    // existing one beats silently creating a second orphan.
+    $ir_slug = $ir->post_name;
+    $want_slug = $opts['welcome_slug'] ?: $ir_slug;
+    if ($src->post_name === $want_slug) {
+        return [
+            'ok' => true, 'already_done' => true,
+            'welcome_page_id' => $source_welcome_id,
+            'welcome_slug'    => $src->post_name,
+            'welcome_permalink' => home_url("/welcome/{$src->post_name}/"),
+            'note' => 'welcome_page already points at a page with this IR slug — nothing to do.',
+        ];
+    }
+
+    $institution = $opts['institution_name']
+        ?: (string) get_post_meta($ir_id, 'institution_name', true)
+        ?: preg_replace('/^Registration\s*[-–]\s*/u', '', $ir->post_title);
+
+    // Source org name, for the automatic substitution. Prefer the source IR's
+    // recorded name; fall back to parsing the welcome title.
+    $src_name = preg_replace('/^Welcome\s*[-–]\s*/u', '', $src->post_title);
+
+    $content = $src->post_content;
+    $applied = [];
+
+    // Automatic: full source org name -> new institution name. Longest-first so
+    // a short name that is a substring of the long one cannot corrupt it.
+    $auto = [];
+    if ($src_name && $institution && $src_name !== $institution) {
+        $auto[$src_name] = $institution;
+    }
+    // Caller-supplied replacements run AFTER, so they can fix the short form
+    // ("RMI" -> "UL") which cannot be derived from the title.
+    $subs = $auto + (array) ($opts['replacements'] ?: []);
+    uksort($subs, function ($a, $b) { return strlen($b) - strlen($a); });
+
+    foreach ($subs as $find => $replace) {
+        if ($find === '' || strpos($content, (string) $find) === false) { continue; }
+        $content = str_replace($find, $replace, $content);
+        $applied[] = $find;
+    }
+
+    $status = $opts['status'] ?: $ir->post_status;
+
+    // Anything still naming the source org after substitution is reported, not
+    // silently shipped — a welcome page that greets the wrong organisation is
+    // the exact failure this endpoint exists to prevent.
+    $residual = [];
+    foreach ([$src_name, $src->post_name] as $probe) {
+        if ($probe && stripos($content, (string) $probe) !== false) { $residual[] = $probe; }
+    }
+
+    if (!empty($opts['dry_run'])) {
+        return [
+            'ok' => true, 'dry_run' => true, 'persisted' => false,
+            'source_welcome_id' => $source_welcome_id,
+            'would_create' => [
+                'title'   => "Welcome - {$institution}",
+                'slug'    => $want_slug,
+                'status'  => $status,
+                'content' => $content,
+            ],
+            'replacements_applied' => $applied,
+            'residual_source_mentions' => $residual,
+            'note' => 'DRY RUN — nothing written.',
+        ];
+    }
+
+    $new_id = wp_insert_post([
+        'post_type'    => 'xen_welcome_page',
+        'post_status'  => $status,
+        'post_title'   => "Welcome - {$institution}",
+        'post_name'    => $want_slug,
+        'post_content' => $content,
+        'post_excerpt' => $src->post_excerpt,
+        'post_author'  => get_current_user_id(),
+    ], true);
+    if (is_wp_error($new_id)) { return $new_id; }
+
+    // Copy all postmeta — this is what carries the org logo, which is NOT in
+    // post_content and cannot be derived. It will point at the SOURCE org's
+    // image until a human swaps it; that is called out in the response.
+    $skip = ['_edit_lock', '_edit_last', '_wp_old_slug'];
+    foreach (get_post_meta($source_welcome_id) as $key => $values) {
+        if (in_array($key, $skip, true)) { continue; }
+        $value = (count($values) === 1) ? maybe_unserialize($values[0]) : array_map('maybe_unserialize', $values);
+        update_post_meta($new_id, $key, $value);
+    }
+
+    foreach (get_object_taxonomies('xen_welcome_page') as $tax) {
+        $terms = wp_get_object_terms($source_welcome_id, $tax, ['fields' => 'ids']);
+        if (!is_wp_error($terms) && !empty($terms)) {
+            wp_set_object_terms($new_id, $terms, $tax);
+        }
+    }
+
+    // Repoint the IR page at its own welcome page. This is the whole point.
+    update_post_meta($ir_id, 'welcome_page', (string) $new_id);
+
+    $final_slug = get_post_field('post_name', $new_id);
+    $permalink  = home_url("/welcome/{$final_slug}/");
+
+    // Verify by re-read rather than trusting update_post_meta's return.
+    $verified = ((int) get_post_meta($ir_id, 'welcome_page', true) === (int) $new_id);
+
+    $out = [
+        'ok'                => $verified,
+        'welcome_page_id'   => $new_id,
+        'welcome_slug'      => $final_slug,
+        'welcome_permalink' => $permalink,
+        'welcome_status'    => get_post_status($new_id),
+        'welcome_edit_url'  => admin_url("post.php?post={$new_id}&action=edit"),
+        'source_welcome_id' => $source_welcome_id,
+        'ir_id'             => $ir_id,
+        'ir_welcome_page_meta_verified' => $verified,
+        'replacements_applied' => $applied,
+        'residual_source_mentions' => $residual,
+        'logo_note' => 'The org logo lives in postmeta, not post_content, and was copied from the '
+                     . 'source. It still shows the SOURCE org\'s image — swap it in wp-admin.',
+    ];
+
+    if ($final_slug !== $want_slug) {
+        $out['ATTENTION'] = "Requested slug '{$want_slug}' was taken; WordPress assigned "
+                          . "'{$final_slug}'. The IR page's success= URL will NOT match. Fix before publishing.";
+    }
+    if (!empty($residual)) {
+        $out['ATTENTION'] = 'Content still mentions the source org (' . implode(', ', $residual)
+                          . '). Pass `replacements` for the short form — it cannot be derived from the title.';
+    }
+    if (!$verified) {
+        $out['ATTENTION'] = 'welcome_page meta did not verify on re-read. Do not publish.';
+    }
+    return $out;
+}
+
+add_action('rest_api_init', function () {
+    // POST /institutional/<id>/welcome-page — clone a welcome page for an IR
+    // post that already exists. Idempotent: re-running returns the existing one.
+    register_rest_route('xen/v1', '/institutional/(?P<id>\d+)/welcome-page', [
+        'methods'             => 'POST',
+        'permission_callback' => function () { return current_user_can('edit_posts'); },
+        'args' => [
+            'welcome_slug'      => ['type' => 'string', 'description' => 'Defaults to the IR post slug.'],
+            'institution_name'  => ['type' => 'string', 'description' => 'Defaults to institution_name meta, else the IR title minus "Registration - ".'],
+            'replacements'      => ['type' => 'object', 'description' => 'Extra find/replace. Needed for the SHORT org name (e.g. {"RMI":"UL"}), which cannot be derived.'],
+            'source_welcome_id' => ['type' => 'integer', 'description' => 'Override the source; defaults to the IR post\'s current welcome_page meta.'],
+            'status'            => ['type' => 'string', 'description' => 'Defaults to the IR post\'s status.'],
+            'dry_run'           => ['type' => 'boolean', 'default' => false],
+        ],
+        'callback' => function ($req) {
+            return xen_clone_welcome_for_ir((int) $req['id'], [
+                'welcome_slug'      => $req->get_param('welcome_slug'),
+                'institution_name'  => $req->get_param('institution_name'),
+                'replacements'      => (array) ($req->get_param('replacements') ?: []),
+                'source_welcome_id' => $req->get_param('source_welcome_id'),
+                'status'            => $req->get_param('status'),
+                'dry_run'           => $req->get_param('dry_run'),
+            ]);
+        },
     ]);
 });
