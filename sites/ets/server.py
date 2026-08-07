@@ -1789,10 +1789,15 @@ async def create_episode(
     date: str | None = None,
     categories: list | None = None,
     tags: list | None = None,
+    featured_media: int | None = None,
     fields: dict | None = None,
 ) -> dict:
     payload: dict = {"title": title, "content": content,
                      "excerpt": excerpt, "status": status}
+    if featured_media is not None:
+        # Set through the post route, never via _thumbnail_id meta — two writers
+        # for one value is how they drift.
+        payload["featured_media"] = int(featured_media)
     if slug:
         payload["slug"] = slug
     if date:
@@ -1873,6 +1878,7 @@ async def update_episode(
     date: str | None = None,
     categories: list | None = None,
     tags: list | None = None,
+    featured_media: int | None = None,
     fields: dict | None = None,
     confirm_protected: bool = False,
 ) -> dict:
@@ -1885,6 +1891,8 @@ async def update_episode(
         payload["categories"] = [int(c) for c in categories]
     if tags is not None:
         payload["tags"] = [int(t) for t in tags]
+    if featured_media is not None:
+        payload["featured_media"] = int(featured_media)
 
     out: dict = {"ok": True, "id": id}
     headers = {"X-ETS-Confirm-Protected": "yes"} if confirm_protected else None
@@ -1915,6 +1923,149 @@ async def update_episode(
 
     if not payload and not fields:
         return {"ok": False, "id": id, "error": "nothing to update — pass at least one field."}
+    return out
+
+
+# PowerPress stores an enclosure as four newline-delimited parts:
+#   <url>\n<byte_length>\n<mime_type>\n<serialized PHP settings array>
+# A bare URL produces no player. A copied enclosure with a swapped URL keeps the
+# WRONG byte length, which half-works — podcast clients use it for seek and
+# download progress, so it looks fine in wp-admin and misbehaves in the app.
+_ENCLOSURE_KEYS = {
+    "public": "enclosure",
+    "member": "_member:enclosure",
+    "member-monthly": "_member-monthly:enclosure",
+}
+
+
+@mcp.tool(
+    description=(
+        "Set one audio enclosure on an episode, building the PowerPress structure "
+        "and VERIFYING the byte length against the real file.\n"
+        "\n"
+        "USE THIS rather than writing `enclosure` through set_episode_fields. "
+        "PowerPress does not store a URL — it stores four newline-delimited parts: "
+        "url, byte length, MIME type, and a serialized PHP settings array. Writing "
+        "a bare URL yields no player at all.\n"
+        "\n"
+        "The failure this exists to prevent: copying another episode's enclosure "
+        "and swapping the URL leaves the previous episode's byte length in place. "
+        "wp-admin looks correct and podcast apps mis-seek. This HEAD-requests the "
+        "file and refuses the write if the length disagrees, unless you override.\n"
+        "\n"
+        "The serialized settings tail is carried over from the tier's existing "
+        "value, or from `copy_settings_from` — never invented, because it encodes "
+        "per-episode podcast settings that cannot be reconstructed.\n"
+        "\n"
+        "TIERS — an ETS episode has three:\n"
+        "  public          `enclosure`                  the free/teaser file\n"
+        "  member          `_member:enclosure`          full episode, secure-members path\n"
+        "  member-monthly  `_member-monthly:enclosure`  usually identical to member\n"
+        "Set each one you need; this writes a single tier per call so a mistake "
+        "cannot take out all three.\n"
+        "\n"
+        "Args:\n"
+        "  post_id: the episode.\n"
+        "  tier: public | member | member-monthly\n"
+        "  url: the mp3 URL.\n"
+        "  byte_length: omit to use the length reported by the server.\n"
+        "  mime_type: defaults to audio/mpeg.\n"
+        "  copy_settings_from: episode ID to borrow the serialized settings tail "
+        "from, when this tier has none yet.\n"
+        "  skip_verify: write even if the byte length disagrees with the file. "
+        "Only for a file not yet uploaded.\n"
+        "  dry_run: show the assembled value, write nothing."
+    ),
+)
+async def set_episode_enclosure(
+    post_id: int,
+    tier: str,
+    url: str,
+    byte_length: int | None = None,
+    mime_type: str = "audio/mpeg",
+    copy_settings_from: int | None = None,
+    skip_verify: bool = False,
+    dry_run: bool = False,
+) -> dict:
+    key = _ENCLOSURE_KEYS.get(tier)
+    if not key:
+        return {"ok": False, "error": f"tier must be one of {sorted(_ENCLOSURE_KEYS)}"}
+
+    # Ask the server what the file actually is. This is the whole safety story.
+    actual_len: int | None = None
+    head_note = None
+    try:
+        hr = await client.head(url, follow_redirects=True, timeout=30.0)
+        if hr.status_code == 200:
+            cl = hr.headers.get("content-length")
+            actual_len = int(cl) if cl and cl.isdigit() else None
+            if actual_len is None:
+                head_note = "Server returned no Content-Length; byte length not verified."
+        else:
+            head_note = f"HEAD returned HTTP {hr.status_code} — file may not be uploaded yet."
+    except Exception as e:
+        head_note = f"Could not reach the file ({type(e).__name__}); byte length not verified."
+
+    if byte_length is None:
+        if actual_len is None:
+            return {"ok": False, "error": "no_byte_length",
+                    "message": "byte_length not supplied and the file could not be measured.",
+                    "head_note": head_note,
+                    "hint": "Upload the file first, or pass byte_length explicitly with skip_verify=True."}
+        byte_length = actual_len
+
+    if actual_len is not None and int(byte_length) != actual_len and not skip_verify:
+        return {
+            "ok": False, "error": "byte_length_mismatch",
+            "supplied": int(byte_length), "actual": actual_len, "url": url,
+            "message": "The byte length does not match the file. This is what a copied "
+                       "enclosure with a swapped URL looks like — it renders fine in "
+                       "wp-admin and mis-seeks in podcast apps.",
+            "hint": f"Use byte_length={actual_len}, or skip_verify=True if you mean it.",
+        }
+
+    # Carry the serialized settings tail. Never invented — it encodes per-episode
+    # podcast settings that cannot be reconstructed from anything visible here.
+    existing = await get_episode_fields(post_id)
+    tail = ""
+    cur = ((existing.get("fields") or {}).get(key) or "") if isinstance(existing, dict) else ""
+    parts = str(cur).split("\n")
+    if len(parts) >= 4 and parts[3].strip():
+        tail = parts[3]
+    elif copy_settings_from:
+        donor = await get_episode_fields(int(copy_settings_from))
+        dparts = str(((donor.get("fields") or {}).get(key) or "")).split("\n")
+        if len(dparts) >= 4:
+            tail = dparts[3]
+
+    value = f"{url}\n{int(byte_length)}\n{mime_type}\n{tail}"
+
+    out: dict = {
+        "post_id": post_id, "tier": tier, "meta_key": key,
+        "url": url, "byte_length": int(byte_length), "mime_type": mime_type,
+        "byte_length_verified": (actual_len is not None and int(byte_length) == actual_len),
+        "settings_tail": "carried from existing" if (len(parts) >= 4 and parts[3].strip())
+                         else ("carried from donor" if tail else "EMPTY"),
+    }
+    if head_note:
+        out["head_note"] = head_note
+    if not tail:
+        out["ATTENTION"] = (
+            "No serialized settings tail was available for this tier. PowerPress may "
+            "not render the player. Pass copy_settings_from=<an episode that has this "
+            "tier> to carry it across."
+        )
+
+    if dry_run:
+        out.update({"ok": True, "dry_run": True, "persisted": False,
+                    "would_write": value[:160] + ("…" if len(value) > 160 else "")})
+        return out
+
+    res = await _episode_set_fields(post_id, {key: value})
+    out["ok"] = bool(res.get("ok"))
+    out["dry_run"] = False
+    out["persisted"] = True
+    out["write_result"] = res.get("integrity")
     return out
 
 if __name__ == "__main__":
