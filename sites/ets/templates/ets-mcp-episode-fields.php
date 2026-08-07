@@ -3,7 +3,7 @@
  * Plugin Name: ETS MCP — Episode Fields (read + guarded write)
  * Description: Exposes per-episode postmeta over REST for the MCP connector, with a
  *              deliberately narrow write path.
- * Version:     1.1.0
+ * Version:     1.2.0
  * Author:      XE Network
  *
  * WHY THIS EXISTS
@@ -47,7 +47,7 @@
 if (!defined('ABSPATH')) { exit; }
 
 if (!defined('ETS_MCP_EPISODE_FIELDS_VERSION')) {
-    define('ETS_MCP_EPISODE_FIELDS_VERSION', '1.1.0');
+    define('ETS_MCP_EPISODE_FIELDS_VERSION', '1.2.0');
 }
 
 /** Only run on the ETS subsite. */
@@ -106,6 +106,43 @@ function ets_mcp_ef_find_field_key($meta_name) {
     ));
     return $key ?: null;
 }
+
+/**
+ * Server-side protection for original posts, on the CORE route too.
+ *
+ * The guard in the fields endpoint only covers meta. Without this, a PATCH to
+ * /wp/v2/episodes/1538 could still rewrite the title, body or status of an
+ * original — the exact thing the house rule forbids — and a client-side check
+ * in the MCP tool is advisory, not enforcement. Anything holding the
+ * Application Password could bypass it.
+ *
+ * Enforcing here makes the rule true regardless of who is calling.
+ * X-ETS-Confirm-Protected: yes is the deliberate override, mirroring
+ * confirm_protected on the fields route.
+ */
+add_filter('rest_pre_insert_xen_episodes', function ($prepared, $request) {
+    if (!ets_mcp_ef_is_target_blog()) { return $prepared; }
+
+    $id = isset($request['id']) ? (int) $request['id'] : 0;
+    if (!$id || !in_array($id, ets_mcp_ef_protected_ids(), true)) {
+        return $prepared;
+    }
+
+    if (strtolower((string) $request->get_header('X-ETS-Confirm-Protected')) === 'yes') {
+        error_log(sprintf(
+            '[ets-mcp-episode-fields] PROTECTED OVERRIDE (core route): post %d by user %d',
+            $id, get_current_user_id()
+        ));
+        return $prepared;
+    }
+
+    return new WP_Error('protected_post', "Post {$id} is a protected original and is never modified.", array(
+        'status'        => 409,
+        'protected_ids' => ets_mcp_ef_protected_ids(),
+        'hint'          => 'House rule from the re-release workflow. To override, send header '
+                         . 'X-ETS-Confirm-Protected: yes — the override is written to the error log.',
+    ));
+}, 10, 2);
 
 /** All meta on a post, with the noise stripped. */
 function ets_mcp_ef_read($post_id) {

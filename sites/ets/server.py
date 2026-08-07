@@ -1658,6 +1658,265 @@ async def set_acf_options(
             )
     return data
 
+
+# --- episode write tools -----------------------------------------------------
+# Episodes are xen_episodes at /wp/v2/episodes. Their distinguishing content —
+# dates, guest, geek rating, audio enclosures, paywall flag — is NOT in
+# post_content and NOT in core REST meta. It lives in postmeta exposed by the
+# ets-mcp-episode-fields mu-plugin. Body and taxonomy go through core REST;
+# fields go through that plugin's guarded route.
+
+# Counters and send-state that belong to the SOURCE episode. Copying these onto
+# a new post inherits another episode's view count and marks its notification
+# email as already sent, which would suppress the real one.
+_EPISODE_DO_NOT_COPY = ("iawp_total_views", "new_episode_email_sent", "_dp_original")
+
+
+async def _episode_set_fields(post_id: int, fields: dict, dry_run: bool = False) -> dict:
+    try:
+        r = await client.post(
+            f"{WP_BASE}/wp-json/xen-ets/v1/episodes/{post_id}/fields",
+            json={"fields": fields, "dry_run": bool(dry_run)},
+        )
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": _err("set_episode_fields", e),
+                "hint": "Is ets-mcp-episode-fields.php deployed on the ETS subsite?"}
+
+
+@mcp.tool(
+    description=(
+        "Read every stored field on an episode — the data that does NOT appear in "
+        "core REST. Read-only.\n"
+        "\n"
+        "core REST returns acf:[] and meta ['_acf_changed','footnotes'] for an "
+        "episode, while the rendered page carries recording date, air date, guest, "
+        "geek rating, the audio enclosures and the paywall flag. This returns what "
+        "the post actually holds — no guessed schema.\n"
+        "\n"
+        "Known keys on a typical episode (verified on 4338 / #266):\n"
+        "  air_date, recording_date   YYYYMMDD strings\n"
+        "  geek_rating                '1'-'10'\n"
+        "  guest_link                 guest post ID\n"
+        "  episode_links, episode_news, episode_chapter_data   HTML/JSON blocks\n"
+        "  gumroad_url\n"
+        "  allow_full_episode_for_non_members   'Yes'/'No' — THE PAYWALL FLAG\n"
+        "  enclosure, _member:enclosure, _member-monthly:enclosure   PowerPress, 3 tiers\n"
+        "  _dp_original               the ORIGINAL post id, for a re-release\n"
+        "\n"
+        "Every ACF field also has an underscore twin (_air_date) holding its field "
+        "KEY. Both are returned. Do not treat the twin as a value.\n"
+        "\n"
+        "Args:\n"
+        "  post_id: the episode."
+    ),
+)
+async def get_episode_fields(post_id: int) -> dict:
+    try:
+        r = await client.get(f"{WP_BASE}/wp-json/xen-ets/v1/episodes/{post_id}/fields")
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": _err("get_episode_fields", e),
+                "hint": "Is ets-mcp-episode-fields.php deployed on the ETS subsite?"}
+
+
+@mcp.tool(
+    description=(
+        "Write stored fields on an episode. Merge semantics — only the named keys "
+        "change.\n"
+        "\n"
+        "CALL get_episode_fields FIRST on a comparable episode to see real key names "
+        "and value formats. Dates are YYYYMMDD strings, not ISO.\n"
+        "\n"
+        "ACF PAIRS ARE HANDLED FOR YOU: each ACF field is stored as two rows — "
+        "air_date holds the value, _air_date holds the field key. Writing the value "
+        "alone leaves wp-admin rendering an EMPTY field over a populated database. "
+        "This carries the companion key across automatically and reports it in "
+        "integrity.acf_keys_auto_bound; anything it could not bind is raised as "
+        "ATTENTION. Send plain names (air_date), not the underscore twins.\n"
+        "\n"
+        "PROTECTED ORIGINALS are refused server-side, not just here — the mu-plugin "
+        "blocks both this route and core PATCH for those IDs.\n"
+        "\n"
+        "dry_run returns before/after and writes nothing.\n"
+        "\n"
+        "Args:\n"
+        "  post_id: the episode.\n"
+        "  fields: {meta_key: value}. Merge semantics.\n"
+        "  dry_run: preview without writing."
+    ),
+)
+async def set_episode_fields(post_id: int, fields: dict, dry_run: bool = False) -> dict:
+    if not fields:
+        return {"ok": False, "error": "fields is required and must be non-empty."}
+    return await _episode_set_fields(post_id, dict(fields), dry_run=dry_run)
+
+
+@mcp.tool(
+    description=(
+        "Create an episode. Defaults to DRAFT — publishing is always an explicit "
+        "choice.\n"
+        "\n"
+        "Creates the post through core REST, then writes `fields` through the "
+        "guarded meta route. Both halves are reported separately, so a post that "
+        "was created but whose fields failed is visible rather than looking like a "
+        "clean success.\n"
+        "\n"
+        "WITHOUT `fields` the episode has a body and NO recording date, air date, "
+        "guest, geek rating or audio player — it will look broken on the front end. "
+        "Read a comparable episode with get_episode_fields and pass the equivalents.\n"
+        "\n"
+        "Do NOT copy these across from another episode: iawp_total_views (that "
+        "episode's view count), new_episode_email_sent (marks the notification as "
+        "already sent, suppressing the real one), _dp_original (re-release lineage — "
+        "set it deliberately or not at all). They are stripped automatically and "
+        "reported in `fields_stripped`.\n"
+        "\n"
+        "Args:\n"
+        "  title, content (HTML body), excerpt, slug\n"
+        "  status: draft (default), publish, pending, future\n"
+        "  date: ISO8601 for scheduling; requires status='future'\n"
+        "  categories / tags: integer lists\n"
+        "  fields: the stored-field dict — see get_episode_fields"
+    ),
+)
+async def create_episode(
+    title: str,
+    content: str = "",
+    excerpt: str = "",
+    slug: str | None = None,
+    status: str = "draft",
+    date: str | None = None,
+    categories: list | None = None,
+    tags: list | None = None,
+    fields: dict | None = None,
+) -> dict:
+    payload: dict = {"title": title, "content": content,
+                     "excerpt": excerpt, "status": status}
+    if slug:
+        payload["slug"] = slug
+    if date:
+        payload["date"] = date
+    if categories:
+        payload["categories"] = [int(c) for c in categories]
+    if tags:
+        payload["tags"] = [int(t) for t in tags]
+
+    try:
+        r = await client.post(f"{WP_BASE}/wp-json/wp/v2/episodes", json=payload)
+        post = r.json()
+    except Exception as e:
+        return {"ok": False, "error": _err("create_episode", e)}
+
+    if not isinstance(post, dict) or not post.get("id"):
+        return {"ok": False, "error": "create failed", "response": str(post)[:400]}
+
+    new_id = int(post["id"])
+    out: dict = {
+        "ok": True,
+        "id": new_id,
+        "status": post.get("status"),
+        "slug": post.get("slug"),
+        "link": post.get("link"),
+        "edit_url": f"{WP_BASE}/wp-admin/post.php?post={new_id}&action=edit",
+        "preview_url": f"{WP_BASE}/?p={new_id}&preview=true",
+    }
+
+    if fields:
+        clean = {k: v for k, v in dict(fields).items() if k not in _EPISODE_DO_NOT_COPY}
+        stripped = [k for k in dict(fields) if k in _EPISODE_DO_NOT_COPY]
+        fr = await _episode_set_fields(new_id, clean)
+        out["fields_result"] = fr
+        out["fields_stripped"] = stripped
+        if not fr.get("ok"):
+            out["ok"] = False
+            out["ATTENTION"] = (
+                f"Post {new_id} WAS created but its fields did not write. It will render "
+                "without dates, guest or player. Fix with set_episode_fields before publishing."
+            )
+    else:
+        out["ATTENTION"] = (
+            "No fields were set. This episode has a body and no recording date, air date, "
+            "guest, geek rating or audio. Read a comparable episode with get_episode_fields "
+            "and set the equivalents before publishing."
+        )
+    return out
+
+
+@mcp.tool(
+    description=(
+        "Update an episode. Partial semantics — anything not passed is left alone.\n"
+        "\n"
+        "PROTECTED ORIGINALS: the mu-plugin refuses these server-side on both the "
+        "core route and the fields route, so the house rule holds even for callers "
+        "that are not this tool. A refusal returns protected_post with the ID list. "
+        "The override is a deliberate header and is written to the site error log.\n"
+        "\n"
+        "Pass `fields` to update stored meta in the same call; ACF companion keys "
+        "are handled automatically. Status changes are explicit — this never "
+        "publishes something that was a draft unless you pass status='publish'.\n"
+        "\n"
+        "Args:\n"
+        "  id: REQUIRED.\n"
+        "  title, content, excerpt, slug, status, date, categories, tags: any subset.\n"
+        "  fields: stored-field dict.\n"
+        "  confirm_protected: override the protected-original guard. Logged loudly."
+    ),
+)
+async def update_episode(
+    id: int,
+    title: str | None = None,
+    content: str | None = None,
+    excerpt: str | None = None,
+    slug: str | None = None,
+    status: str | None = None,
+    date: str | None = None,
+    categories: list | None = None,
+    tags: list | None = None,
+    fields: dict | None = None,
+    confirm_protected: bool = False,
+) -> dict:
+    payload: dict = {}
+    for k, v in (("title", title), ("content", content), ("excerpt", excerpt),
+                 ("slug", slug), ("status", status), ("date", date)):
+        if v is not None:
+            payload[k] = v
+    if categories is not None:
+        payload["categories"] = [int(c) for c in categories]
+    if tags is not None:
+        payload["tags"] = [int(t) for t in tags]
+
+    out: dict = {"ok": True, "id": id}
+    headers = {"X-ETS-Confirm-Protected": "yes"} if confirm_protected else None
+
+    if payload:
+        try:
+            r = await client.post(f"{WP_BASE}/wp-json/wp/v2/episodes/{id}",
+                                  json=payload, headers=headers)
+            post = r.json()
+        except Exception as e:
+            return {"ok": False, "id": id, "error": _err("update_episode", e)}
+
+        if isinstance(post, dict) and post.get("code"):
+            return {"ok": False, "id": id, "error": post.get("code"),
+                    "message": post.get("message"),
+                    "data": post.get("data"),
+                    "hint": "Protected originals are refused server-side. "
+                            "Pass confirm_protected=True only if you truly mean it."}
+        out.update({"status": post.get("status"), "slug": post.get("slug"),
+                    "link": post.get("link"), "updated": sorted(payload.keys())})
+
+    if fields:
+        fr = await _episode_set_fields(id, dict(fields))
+        out["fields_result"] = fr
+        if not fr.get("ok"):
+            out["ok"] = False
+            out["ATTENTION"] = "Field write did not verify — see fields_result.integrity."
+
+    if not payload and not fields:
+        return {"ok": False, "id": id, "error": "nothing to update — pass at least one field."}
+    return out
+
 if __name__ == "__main__":
     print(
         f"[wp-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",
