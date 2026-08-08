@@ -2156,6 +2156,72 @@ async def set_episode_enclosure(
     out["write_result"] = res.get("integrity")
     return out
 
+
+@mcp.tool(
+    description=(
+        "Snapshot the PAYWALL FLAG and all three audio enclosures for every "
+        "episode, in one call. Read-only. This is the monitoring baseline.\n"
+        "\n"
+        "WHY IT EXISTS: feedwatch hashes the two podcast feeds, which only sees "
+        "what reaches a feed. Two things it cannot see:\n"
+        "\n"
+        "  allow_full_episode_for_non_members — 'Yes' publishes a PAID episode "
+        "to non-members. Nothing monitored it. It is arguably a worse outcome "
+        "than an audio swap and materially easier to do by accident.\n"
+        "\n"
+        "  the member tiers — _member:enclosure and _member-monthly:enclosure "
+        "never appear in the public feed at all, so a swap there is invisible "
+        "to a feed hash.\n"
+        "\n"
+        "Both live in postmeta, and postmeta writes do not reliably bump "
+        "post_modified — so get_content_fingerprint is NOT a dependable "
+        "tripwire for either. WSAL event 2054 now records such a change, but "
+        "that is detection after the fact. This is the baseline you diff.\n"
+        "\n"
+        "Returns per episode: post_id, title, status, modified_gmt, the three "
+        "enclosures as url + byte_length + mime_type, and the paywall flag. "
+        "Plus a summary listing every episode currently open to non-members.\n"
+        "\n"
+        "The serialized PowerPress settings tail is deliberately omitted — it "
+        "is bulky and irrelevant to a diff — but its presence is reported, "
+        "because an enclosure without one may not render a player.\n"
+        "\n"
+        "Includes drafts and scheduled posts by default. A scheduled episode is "
+        "exactly the interesting case: the first run of this found post 4429 "
+        "(#281, scheduled) carrying Episode #279's audio on its member tier.\n"
+        "\n"
+        "Ordered by post_id and free of volatile fields so two runs diff "
+        "cleanly. Roughly 295 rows.\n"
+        "\n"
+        "Args:\n"
+        "  status: comma-separated post statuses. Default covers publish, "
+        "draft, future, pending and private — narrow it only if you know why."
+    ),
+)
+async def list_episode_enclosures(status: str | None = None) -> dict | str:
+    # NOTE the namespace. The activity-log tools go through _ets_route against
+    # ETS_MCP_ROUTE (ets-mcp/v1); this route is registered under xen-ets/v1 by
+    # ets-mcp-episode-fields.php. They are different plugins and different
+    # namespaces — reusing the wrong helper yields a 404 that looks like a
+    # missing feature rather than a wrong prefix.
+    params: dict[str, Any] = {}
+    if status:
+        params["status"] = status
+    try:
+        r = await client.get(
+            f"{WP_BASE}/wp-json/xen-ets/v1/episodes/enclosures",
+            params=params or None,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": _err("list_episode_enclosures", e),
+            "hint": "Is ets-mcp-episode-fields.php 1.3.0+ deployed to "
+                    "wp-content/mu-plugins on the ETS subsite?",
+        }
+
 if __name__ == "__main__":
     print(
         f"[wp-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",
