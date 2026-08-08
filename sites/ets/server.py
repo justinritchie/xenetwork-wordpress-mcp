@@ -1387,6 +1387,29 @@ def _int_list(v: Any) -> list[int] | None:
     return [int(v)]
 
 
+# Network-scope events do not live on the ETS subsite. 4008/4009 (super admin
+# granted/revoked), 4010 (user added to a site), 6060 (an event enabled or
+# disabled) and 7001-7005 (subsite lifecycle) are written against blog 1, so a
+# subsite-scoped query returns count:0 — which reads exactly like "it never
+# happened". That is not hypothetical: the 6060 events from the 2026-08-07 WSAL
+# configuration change were visible in Network Admin and invisible here.
+_NETWORK_SCOPE_EVENTS = (4008, 4009, 4010, 6060, 7001, 7002, 7003, 7004, 7005)
+
+
+def _scope_param(site_id):
+    """Normalise site_id for the PHP route. None means 'leave it alone'."""
+    if site_id is None or site_id == "":
+        return None
+    if isinstance(site_id, str) and site_id.strip().lower() == "all":
+        return "all"
+    return int(site_id)
+
+
+def _is_network_wide(site_id) -> bool:
+    v = _scope_param(site_id)
+    return v == "all" or v == 0
+
+
 async def _ets_route(path: str, params: dict) -> dict | str:
     try:
         r = await client.get(f"{ETS_MCP_ROUTE}{path}", params=params)
@@ -1415,7 +1438,22 @@ async def _ets_route(path: str, params: dict) -> dict | str:
         "one nobody thought to anticipate.\n"
         "\n"
         "since/until accept ISO dates ('2026-07-27'), datetimes, or unix "
-        "timestamps."
+        "timestamps.\n"
+        "\n"
+        "SCOPE — the subsite view is NOT complete. Defaults to the ETS subsite "
+        "(blog 2). Network-scope events are written against blog 1 and are "
+        "INVISIBLE by default: 4008/4009 super admin granted or revoked, 4010 "
+        "user added to a site, 6060 an event enabled or disabled, 7001-7005 "
+        "subsite lifecycle. A subsite query returns count:0 for those, which "
+        "reads exactly like they never happened — that assumption is what "
+        "produced this parameter. Pass site_id='all' for network-wide, or an "
+        "integer for a specific blog. Every response reports what it used in "
+        "`query_scope`; read it before concluding anything from an empty result.\n"
+        "\n"
+        "WATCH THE TIME BOUND when hunting a specific event. `since` is "
+        "inclusive of the date but resolves to a moment — an event late on the "
+        "same UTC day can fall outside `since=<that date>`. If you expect rows "
+        "and get none, widen the window before concluding the event is absent."
     ),
 )
 async def get_activity_log(
@@ -1426,6 +1464,7 @@ async def get_activity_log(
     event_ids: Any = None,
     limit: int = 100,
     all_users: bool = False,
+    site_id: int | str | None = None,
 ) -> dict | str:
     # SCOPE DISCIPLINE. This log holds ~2,000,000 events across ~2 years, and a
     # typical week is ~87,000 of which roughly 69% are botnet failed logins and
@@ -1452,7 +1491,28 @@ async def get_activity_log(
         excl = [1002, 1003]
     only = _int_list(event_ids)
 
+    # A network-wide sweep is BROADER than the case the rule above was written
+    # for — it adds every other blog on the multisite to an already-2M-row table.
+    # all_users + site_id=all + no time bound is the widest query this connector
+    # can express, so it has to be asked for precisely rather than stumbled into.
+    # Narrowing by event_ids is enough; this is about accidental scope, not
+    # forbidding the query.
+    if _is_network_wide(site_id) and all_users and not since and not only:
+        return {
+            "ok": False,
+            "reason": "site_id='all' with all_users=True and no `since` would sweep the "
+                      "ENTIRE network log — roughly 2,000,000 rows across every blog, "
+                      "about 69% of it botnet failed logins.",
+            "hint": "Add `since`, or narrow with `event_ids`. For the network-scope "
+                    f"events specifically, event_ids={list(_NETWORK_SCOPE_EVENTS)} is "
+                    "usually what you want.",
+            "query_scope": {"requested": "network", "refused": True},
+        }
+
     params: dict[str, Any] = {"limit": max(1, min(int(limit), 500))}
+    scope = _scope_param(site_id)
+    if scope is not None:
+        params["site_id"] = scope
     if username:
         params["username"] = username
     if since:
@@ -1484,12 +1544,23 @@ async def get_activity_log(
         "burst of any other event type is immediately visible. Includes ALL "
         "event codes — nothing is excluded here, because the whole point is "
         "seeing relative volume."
+        "\n"
+        "SCOPE — the subsite view is NOT complete. Defaults to the ETS "
+        "subsite (blog 2). Network-scope events are written against blog 1 "
+        "and are INVISIBLE by default: 4008/4009 super admin granted or "
+        "revoked, 4010 user added to a site, 6060 an event enabled or "
+        "disabled, 7001-7005 subsite lifecycle. A subsite query returns "
+        "count:0 for those, which reads exactly like they never happened. "
+        "Pass site_id='all' to see them, or an integer for another blog. "
+        "Every response reports the scope it used in `query_scope` — read "
+        "it before drawing a conclusion from an empty result.\n"
     ),
 )
 async def get_activity_log_summary(
     since: str | None = None,
     username: str | None = None,
     all_users: bool = False,
+    site_id: int | str | None = None,
 ) -> dict | str:
     # Summary is the one place a site-wide view is genuinely useful — it is
     # counts, not content, so it reveals volume without sweeping up anyone's
@@ -1505,6 +1576,9 @@ async def get_activity_log_summary(
                       "choice, not the default.",
         }
     params: dict[str, Any] = {}
+    scope = _scope_param(site_id)
+    if scope is not None:
+        params["site_id"] = scope
     if since:
         params["since"] = since
     if username:
@@ -1521,10 +1595,24 @@ async def get_activity_log_summary(
         "Check this FIRST when the log matters as evidence. WSAL free prunes "
         "on a rolling window by default, and anything already pruned is "
         "unrecoverable — no tooling built on top can bring it back."
+        "\n"
+        "SCOPE — the subsite view is NOT complete. Defaults to the ETS "
+        "subsite (blog 2). Network-scope events are written against blog 1 "
+        "and are INVISIBLE by default: 4008/4009 super admin granted or "
+        "revoked, 4010 user added to a site, 6060 an event enabled or "
+        "disabled, 7001-7005 subsite lifecycle. A subsite query returns "
+        "count:0 for those, which reads exactly like they never happened. "
+        "Pass site_id='all' to see them, or an integer for another blog. "
+        "Every response reports the scope it used in `query_scope` — read "
+        "it before drawing a conclusion from an empty result.\n"
     ),
 )
-async def get_activity_log_retention() -> dict | str:
-    return await _ets_route("/activity-log/retention", {})
+async def get_activity_log_retention(site_id: int | str | None = None) -> dict | str:
+    params: dict[str, Any] = {}
+    scope = _scope_param(site_id)
+    if scope is not None:
+        params["site_id"] = scope
+    return await _ets_route("/activity-log/retention", params)
 
 
 

@@ -6,7 +6,7 @@
  *              so the wordpress-energytransitionshow MCP can see who has a post
  *              open in the block editor and read the audio enclosure without
  *              scraping rendered HTML.
- * Version:     1.0.0
+ * Version:     1.1.0
  * Author:      XE Network
  *
  * WHY A COMPUTED FIELD RATHER THAN register_meta
@@ -171,6 +171,81 @@ if (!defined('ETS_MCP_NS')) {
 }
 
 /** Occurrences/metadata table names on the base prefix. */
+/**
+ * Resolve the requested query scope, for all three activity-log routes.
+ *
+ * WSAL writes network-wide to the BASE-prefix table and identifies the subsite
+ * with a site_id column. These routes filtered to ETS unconditionally, which is
+ * right for episode work and wrong for the events that only exist at network
+ * level — 4008/4009 (super admin granted/revoked), 4010 (user added to a site),
+ * 6060 (an event enabled/disabled) and 7001-7005 (subsite lifecycle).
+ *
+ * That gap was not theoretical. The 6060 events written by the 2026-08-07 WSAL
+ * configuration change are visible in the Network Admin viewer and returned
+ * count:0 through this connector, because they carry site_id 1.
+ *
+ *   absent      -> ETS_MCP_BLOG_ID. UNCHANGED default; no existing caller moves.
+ *   integer     -> that blog id
+ *   0 | 'all'   -> omit the site_id predicate entirely (network-wide)
+ *
+ * One resolver for all three routes on purpose: the ticket documented three
+ * separate hardcoded filters, and three places to change is how they diverge.
+ * Callers are told which scope they got in every response — in an evidence
+ * context, ambiguity about which blog a row came from is a defect.
+ */
+function ets_mcp_wsal_scope($req) {
+    $raw = $req->get_param('site_id');
+
+    if ($raw === null || $raw === '') {
+        return array(
+            'blog_id'      => (int) ETS_MCP_BLOG_ID,
+            'network_wide' => false,
+            'scope'        => 'subsite',
+            'requested'    => null,
+        );
+    }
+
+    if (is_string($raw) && strtolower(trim($raw)) === 'all') {
+        return array(
+            'blog_id'      => null,
+            'network_wide' => true,
+            'scope'        => 'network',
+            'requested'    => 'all',
+        );
+    }
+
+    $n = (int) $raw;
+    if ($n === 0) {
+        return array(
+            'blog_id'      => null,
+            'network_wide' => true,
+            'scope'        => 'network',
+            'requested'    => 0,
+        );
+    }
+
+    return array(
+        'blog_id'      => $n,
+        'network_wide' => false,
+        'scope'        => 'subsite',
+        'requested'    => $n,
+    );
+}
+
+/** The scope block echoed back in every response. */
+function ets_mcp_wsal_scope_report($scope) {
+    return array(
+        'scope'         => $scope['scope'],
+        'blog_id'       => $scope['blog_id'],
+        'network_wide'  => $scope['network_wide'],
+        'site_id_param' => $scope['requested'],
+        'note'          => $scope['network_wide']
+            ? 'NETWORK-WIDE: rows may come from any blog. Read each row\'s site_id.'
+            : 'Scoped to blog ' . $scope['blog_id'] . '. Network-scope events '
+              . '(4008/4009/4010/6060/7001-7005) are NOT visible here — pass site_id="all".',
+    );
+}
+
 function ets_mcp_wsal_tables() {
     global $wpdb;
     return array(
@@ -407,12 +482,13 @@ add_action('rest_api_init', function () {
 
             $cols = ets_mcp_wsal_columns();
             $denorm = in_array('username', $cols, true);
-            $blog_id = (int) ETS_MCP_BLOG_ID;
+            $scope = ets_mcp_wsal_scope($req);
+            $blog_id = $scope['blog_id'];
 
             $where = array();
             $args = array();
 
-            if (in_array('site_id', $cols, true)) {
+            if (in_array('site_id', $cols, true) && !$scope['network_wide']) {
                 $where[] = 'site_id = %d';
                 $args[] = $blog_id;
             }
@@ -516,6 +592,7 @@ add_action('rest_api_init', function () {
                 'schema_layout' => $denorm ? 'denormalized (WSAL 4.x+)' : 'metadata-joined (pre-4.x)',
                 'table'         => $t['occ'],
                 'blog_id'       => $blog_id,
+                'query_scope'   => ets_mcp_wsal_scope_report($scope),
                 'excluded_event_ids' => array_values((array) $excl),
                 'count'         => count($events),
                 'events'        => $events,
@@ -538,11 +615,12 @@ add_action('rest_api_init', function () {
             $cols = ets_mcp_wsal_columns();
             $denorm = in_array('username', $cols, true);
 
+            $scope = ets_mcp_wsal_scope($req);
             $where = array();
             $args = array();
-            if (in_array('site_id', $cols, true)) {
+            if (in_array('site_id', $cols, true) && !$scope['network_wide']) {
                 $where[] = 'site_id = %d';
-                $args[] = (int) ETS_MCP_BLOG_ID;
+                $args[] = $scope['blog_id'];
             }
             $since = ets_mcp_to_ts($req->get_param('since'));
             if ($since !== null) {
@@ -582,6 +660,7 @@ add_action('rest_api_init', function () {
                 'note' => 'Includes ALL event codes, failed logins among them — '
                         . 'the point of a summary is that high-volume noise '
                         . 'appears as one number instead of hundreds of rows.',
+                'query_scope' => ets_mcp_wsal_scope_report($scope),
                 'groups' => $out,
                 'total_events' => array_sum(array_column($out, 'count')),
             ), 200);
@@ -592,7 +671,10 @@ add_action('rest_api_init', function () {
     register_rest_route(ETS_MCP_NS, '/activity-log/retention', array(
         'methods'             => 'GET',
         'permission_callback' => $can_read,
-        'callback'            => function () {
+        // $req added when this route gained site_id. It previously took no
+        // arguments, so reading a parameter fataled on a null — a 500, not a
+        // degraded response.
+        'callback'            => function ($req) {
             global $wpdb;
             $t = ets_mcp_wsal_tables();
             $exists = ets_mcp_wsal_table_exists($t['occ']);
@@ -614,13 +696,19 @@ add_action('rest_api_init', function () {
                 'pruning_limit'         => $get('wsal_pruning-limit'),
             );
 
+            // Resolved OUTSIDE the $exists branch on purpose: the return below
+            // reports the scope unconditionally, and a scope defined only on the
+            // happy path is null everywhere else — which fatals rather than
+            // degrading. That cost a 500 on first deploy.
+            $ret_scope = ets_mcp_wsal_scope($req);
+
             $oldest = $newest = $total = null;
             if ($exists) {
                 $cols = ets_mcp_wsal_columns();
-                if (in_array('site_id', $cols, true)) {
+                if (in_array('site_id', $cols, true) && !$ret_scope['network_wide']) {
                     $row = $wpdb->get_row($wpdb->prepare(
                         "SELECT MIN(created_on) AS oldest, MAX(created_on) AS newest, COUNT(*) AS n "
-                        . "FROM {$t['occ']} WHERE site_id = %d", (int) ETS_MCP_BLOG_ID
+                        . "FROM {$t['occ']} WHERE site_id = %d", $ret_scope['blog_id']
                     ), ARRAY_A);
                 } else {
                     $row = $wpdb->get_row(
@@ -640,6 +728,7 @@ add_action('rest_api_init', function () {
 
             return new WP_REST_Response(array(
                 'ok' => true,
+                'query_scope' => ets_mcp_wsal_scope_report($ret_scope),
                 'table_exists' => $exists,
                 'settings' => $settings,
                 'pruning_active' => $pruning_on,
