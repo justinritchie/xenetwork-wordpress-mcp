@@ -3,7 +3,7 @@
  * Plugin Name: ETS MCP — Episode Fields (read + guarded write)
  * Description: Exposes per-episode postmeta over REST for the MCP connector, with a
  *              deliberately narrow write path.
- * Version:     1.2.0
+ * Version:     1.3.0
  * Author:      XE Network
  *
  * WHY THIS EXISTS
@@ -47,7 +47,7 @@
 if (!defined('ABSPATH')) { exit; }
 
 if (!defined('ETS_MCP_EPISODE_FIELDS_VERSION')) {
-    define('ETS_MCP_EPISODE_FIELDS_VERSION', '1.2.0');
+    define('ETS_MCP_EPISODE_FIELDS_VERSION', '1.3.0');
 }
 
 /** Only run on the ETS subsite. */
@@ -177,6 +177,40 @@ add_action('rest_api_init', function () {
         },
     ));
 
+    // BULK SNAPSHOT — every episode's enclosures and paywall flag, one call.
+    //
+    // WHY THIS IS NOT get_episode_fields IN A LOOP
+    // 295 episodes means 295 round trips, which is not viable on a schedule.
+    // More importantly this is a MONITORING baseline: feedwatch hashes the two
+    // podcast feeds, which only sees what reaches a feed. Two things it misses:
+    //
+    //   allow_full_episode_for_non_members — flip it to 'Yes' and a paid episode
+    //   is published to non-members. Arguably worse than an audio swap and
+    //   materially easier to do. Nothing watched it.
+    //
+    //   the member tiers — _member:enclosure and _member-monthly:enclosure never
+    //   appear in the public feed at all.
+    //
+    // Both live in postmeta, and postmeta writes do not reliably bump
+    // post_modified, so get_content_fingerprint is not a dependable tripwire for
+    // either. Event 2054 now records the change, but that is detection after the
+    // fact — this is the baseline you can diff.
+    //
+    // Ordered by post_id and free of the serialized settings tail so the output
+    // diffs cleanly.
+    register_rest_route('xen-ets/v1', '/episodes/enclosures', array(
+        'methods'             => 'GET',
+        'permission_callback' => function () { return current_user_can('edit_posts'); },
+        'args' => array(
+            'status' => array('type' => 'string',
+                              'description' => "Comma-separated post statuses. Default: all of "
+                                             . "publish,draft,future,pending,private. A SCHEDULED "
+                                             . "episode is exactly the interesting case, so drafts "
+                                             . "and future posts are included by default."),
+        ),
+        'callback' => 'ets_mcp_ef_enclosure_snapshot',
+    ));
+
     // WRITE — one dedicated, guarded route.
     register_rest_route('xen-ets/v1', '/episodes/(?P<id>\d+)/fields', array(
         'methods'             => 'POST',
@@ -216,6 +250,86 @@ add_action('rest_api_init', function () {
         },
     ));
 });
+
+/**
+ * Split a PowerPress enclosure into the parts worth diffing.
+ *
+ * Stored as four newline-delimited parts: url, byte length, MIME type, and a
+ * serialized PHP settings array. The tail is bulky and irrelevant to a diff, so
+ * it is deliberately dropped — but its PRESENCE is reported, because an
+ * enclosure without one may not render a player.
+ */
+function ets_mcp_ef_split_enclosure($raw) {
+    if (!is_string($raw) || $raw === '') { return null; }
+    $p = explode("\n", $raw);
+    return array(
+        'url'          => isset($p[0]) ? trim($p[0]) : null,
+        'byte_length'  => (isset($p[1]) && is_numeric(trim($p[1]))) ? (int) trim($p[1]) : null,
+        'mime_type'    => isset($p[2]) ? trim($p[2]) : null,
+        'has_settings' => isset($p[3]) && trim($p[3]) !== '',
+    );
+}
+
+function ets_mcp_ef_enclosure_snapshot($req) {
+    $status = $req->get_param('status');
+    $statuses = $status
+        ? array_values(array_filter(array_map('trim', explode(',', (string) $status))))
+        : array('publish', 'draft', 'future', 'pending', 'private');
+
+    $q = new WP_Query(array(
+        'post_type'      => 'xen_episodes',
+        'post_status'    => $statuses,
+        'posts_per_page' => -1,
+        'orderby'        => 'ID',
+        'order'          => 'ASC',
+        'no_found_rows'  => true,
+        'fields'         => 'ids',
+    ));
+
+    $rows = array();
+    foreach ($q->posts as $pid) {
+        $pid = (int) $pid;
+        $paywall = get_post_meta($pid, 'allow_full_episode_for_non_members', true);
+        $row = array(
+            'post_id'      => $pid,
+            'title'        => get_the_title($pid),
+            'status'       => get_post_status($pid),
+            'modified_gmt' => get_post_field('post_modified_gmt', $pid),
+            'enclosure_public'         => ets_mcp_ef_split_enclosure(get_post_meta($pid, 'enclosure', true)),
+            'enclosure_member'         => ets_mcp_ef_split_enclosure(get_post_meta($pid, '_member:enclosure', true)),
+            'enclosure_member_monthly' => ets_mcp_ef_split_enclosure(get_post_meta($pid, '_member-monthly:enclosure', true)),
+            'allow_full_episode_for_non_members' => ($paywall === '' ? null : $paywall),
+        );
+        $rows[] = $row;
+    }
+
+    // Count the state that matters at a glance, so a monitor does not have to
+    // walk the array to know whether anything is open to non-members.
+    $open = array();
+    foreach ($rows as $r) {
+        if (strtolower((string) $r['allow_full_episode_for_non_members']) === 'yes') {
+            $open[] = $r['post_id'];
+        }
+    }
+
+    return array(
+        'ok'        => true,
+        'count'     => count($rows),
+        'statuses'  => $statuses,
+        'episodes'  => $rows,
+        'summary'   => array(
+            'open_to_non_members'       => $open,
+            'open_to_non_members_count' => count($open),
+        ),
+        '_meta' => array(
+            'plugin'  => 'ets-mcp-episode-fields',
+            'version' => ETS_MCP_EPISODE_FIELDS_VERSION,
+            'blog_id' => get_current_blog_id(),
+            'note'    => 'Read-only. Ordered by post_id, serialized settings tail omitted, '
+                       . 'so the payload diffs cleanly between runs.',
+        ),
+    );
+}
 
 function ets_mcp_ef_write($req) {
     $id      = (int) $req['id'];
