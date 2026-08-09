@@ -40,6 +40,7 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Any
 
+import datetime as _dt
 import httpx
 from fastmcp import FastMCP
 
@@ -1410,12 +1411,109 @@ def _is_network_wide(site_id) -> bool:
     return v == "all" or v == 0
 
 
+# A network-scoped query with a username filter over a wide window drops the
+# site_id predicate — the one selective index the query had — and scans a
+# 4.85M-row table. MEASURED 2026-08-08: username=chris + site_id=all +
+# since=2024-08-06 completes in 31.7s. The client default is 30s, so it failed
+# by a two-second margin and surfaced as a bare ReadTimeout.
+#
+# That is worth stating plainly, because the obvious reading of the symptom is
+# "needs an index on a 4.85M-row shared production table" — a planned schema
+# change on a live multisite. It does not. The query works; the caller hung up.
+_ETS_NETWORK_TIMEOUT = httpx.Timeout(90.0, connect=10.0)
+
+
+# ---------------------------------------------------------------------------
+# WINDOWING — why wide activity-log queries are split rather than waited on
+#
+# MEASURED 2026-08-08, username=chris, network scope:
+#     7 days   ->   2.8s,   305 events
+#     2 years  ->  30-40s,  HTTP 502 from the WP Engine gateway
+#
+# The table is ~4.85M rows and `username` is not selectively indexed, so a
+# username filter scans in proportion to the window. Two years of scanning to
+# return 4,889 events crosses a server-side limit this connector cannot raise.
+#
+# Three fixes were considered:
+#   raise the client timeout  - treats a server limit as a client one; the 502
+#                               proved it does not work
+#   add a database index      - a schema change on a shared production table
+#                               holding evidence in a live matter
+#   split the window          - each slice is cheap and always returns
+#
+# The third needs no schema change and no elevated privilege, so that is what
+# this does. A wide request becomes N bounded requests, merged.
+_ETS_MAX_WINDOW_DAYS = 45
+
+
+def _iso_day(ts: float) -> str:
+    return _dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+def _parse_since(since) -> float | None:
+    """Best-effort ISO date / datetime / unix -> epoch seconds."""
+    if since in (None, ""):
+        return None
+    if isinstance(since, (int, float)):
+        return float(since)
+    txt = str(since).strip()
+    if txt.replace(".", "", 1).isdigit():
+        return float(txt)
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return _dt.datetime.strptime(txt, fmt).replace(
+                tzinfo=_dt.timezone.utc).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _windows(since_ts: float, until_ts: float, days: int = _ETS_MAX_WINDOW_DAYS):
+    """Yield (since_iso, until_iso) slices, oldest first."""
+    step = days * 86400
+    cur = since_ts
+    while cur < until_ts:
+        end = min(cur + step, until_ts)
+        yield _iso_day(cur), _iso_day(end)
+        cur = end
+
+
 async def _ets_route(path: str, params: dict) -> dict | str:
+    # The longer budget applies to EVERY activity-log call, not just network
+    # scope. First attempt scoped it to network only, and the acceptance run
+    # immediately showed why that was wrong: username=chris + since=2024-08-06
+    # at SUBSITE scope also exceeds 30s. The cost is the username filter over a
+    # wide window against a multi-million-row table; site_id is not what makes
+    # it slow. A generous timeout costs nothing when a query is fast.
+    network = str(params.get("site_id", "")).lower() in ("all", "0")
+
     try:
-        r = await client.get(f"{ETS_MCP_ROUTE}{path}", params=params)
+        r = await client.get(f"{ETS_MCP_ROUTE}{path}", params=params,
+                             timeout=_ETS_NETWORK_TIMEOUT)
         if r.status_code == 404:
             return {"ok": False, "reason": _WSAL_MISSING_HINT}
         r.raise_for_status()
+    except httpx.ReadTimeout:
+        # Never surface a bare ReadTimeout. An agent that sees one has no way to
+        # know the query is recoverable by narrowing.
+        return {
+            "ok": False,
+            "error": "query_timeout",
+            "timed_out_after_seconds": 90,
+            "scope": "network" if network else "subsite",
+            "reason": (
+                "The query did not return in time. Network scope drops the site_id "
+                "predicate and scans ~4.85M rows; combining it with a username "
+                "filter over a wide window is the slowest shape this connector "
+                "can produce."
+            ),
+            "hint": (
+                "This is recoverable — narrow it rather than concluding there is no "
+                "data. Try a shorter `since`, add `event_ids`, or drop `username` "
+                "(the unfiltered network summary is fast). A measured reference: "
+                "username + site_id=all + since=2024-08-06 took 31.7s."
+            ),
+        }
     except Exception as e:
         return _err(f"ets-mcp{path}", e)
     return r.json()
@@ -1583,6 +1681,55 @@ async def get_activity_log_summary(
         params["since"] = since
     if username:
         params["username"] = username
+    # A username filter over a wide window is the shape that 502s. Split it into
+    # bounded slices and merge, rather than issuing one query that dies at the
+    # gateway. Each slice is a few seconds; the caller gets the same answer.
+    since_ts = _parse_since(since)
+    now = _dt.datetime.now(_dt.timezone.utc).timestamp()
+    span_days = ((now - since_ts) / 86400) if since_ts else 0
+
+    if username and since_ts and span_days > _ETS_MAX_WINDOW_DAYS:
+        merged: dict[int, dict] = {}
+        slices = 0
+        for w_since, w_until in _windows(since_ts, now):
+            wp = dict(params, since=w_since, until=w_until)
+            part = await _ets_route("/activity-log/summary", wp)
+            if not isinstance(part, dict) or part.get("ok") is False:
+                return {
+                    "ok": False,
+                    "error": "window_slice_failed",
+                    "failed_window": {"since": w_since, "until": w_until},
+                    "completed_slices": slices,
+                    "detail": part,
+                    "hint": "One slice of a windowed query failed. Retry with a "
+                            "narrower `since`, or query the failing window alone.",
+                }
+            slices += 1
+            for g in part.get("groups") or []:
+                code = g.get("alert_id") or g.get("event_id")
+                if code is None:
+                    continue
+                row = merged.setdefault(code, dict(g))
+                if row is not g:
+                    row["count"] = (row.get("count") or 0) + (g.get("count") or 0)
+
+        groups = sorted(merged.values(), key=lambda g: -(g.get("count") or 0))
+        return {
+            "ok": True,
+            "groups": groups,
+            "total_events": sum(g.get("count") or 0 for g in groups),
+            "query_scope": {"scope": "network" if _is_network_wide(site_id) else "subsite",
+                            "site_id_param": _scope_param(site_id)},
+            "windowed": {
+                "reason": "A username filter over a wide window exceeds the server's "
+                          "request limit — measured: 7 days 2.8s, 2 years HTTP 502. "
+                          "Split rather than waited on.",
+                "slices": slices,
+                "days_per_slice": _ETS_MAX_WINDOW_DAYS,
+                "span_days": round(span_days, 1),
+            },
+        }
+
     return await _ets_route("/activity-log/summary", params)
 
 
@@ -2219,6 +2366,61 @@ async def list_episode_enclosures(status: str | None = None) -> dict | str:
             "ok": False,
             "error": _err("list_episode_enclosures", e),
             "hint": "Is ets-mcp-episode-fields.php 1.3.0+ deployed to "
+                    "wp-content/mu-plugins on the ETS subsite?",
+        }
+
+
+@mcp.tool(
+    description=(
+        "CHEAP TRIPWIRE for the enclosure + paywall state. Call this every run; "
+        "call list_episode_enclosures only when it changes. Read-only, ~1 KB.\n"
+        "\n"
+        "Store `fingerprint` and compare next run. Unchanged means no enclosure "
+        "URL, no byte length and no paywall flag moved on ANY episode — stop "
+        "there, nothing needs investigating. Same idiom as "
+        "get_content_fingerprint, applied to postmeta.\n"
+        "\n"
+        "WHY: list_episode_enclosures is ~213 KB for 295 episodes. Correct for a "
+        "human investigation, wrong for a task running 15 times a day — every "
+        "run would exceed the tool-output limit and spill to a temp file, "
+        "burning context on the fourteen runs where nothing happened.\n"
+        "\n"
+        "The hash covers, per episode: post_id, all three enclosure URLs, all "
+        "three byte lengths, and allow_full_episode_for_non_members. Nothing "
+        "volatile, so two unchanged runs are byte-identical.\n"
+        "\n"
+        "`newest_modified_gmt` is reported but deliberately NOT hashed. Postmeta "
+        "writes do not reliably bump post_modified — that is the whole reason "
+        "this tool exists rather than relying on the content fingerprint — so "
+        "including it would make the hash both noisy and untrustworthy at once. "
+        "Do not treat an unchanged modified_gmt as evidence nothing happened.\n"
+        "\n"
+        "`open_to_non_members` is returned in full because it is small and it is "
+        "the thing most worth eyeballing: any episode listed there is readable "
+        "by non-members right now.\n"
+        "\n"
+        "Args:\n"
+        "  status: same default as list_episode_enclosures (publish, draft, "
+        "future, pending, private). Keep it consistent between runs or the "
+        "fingerprint will change for the wrong reason."
+    ),
+)
+async def get_enclosure_fingerprint(status: str | None = None) -> dict | str:
+    params: dict[str, Any] = {}
+    if status:
+        params["status"] = status
+    try:
+        r = await client.get(
+            f"{WP_BASE}/wp-json/xen-ets/v1/episodes/enclosures/fingerprint",
+            params=params or None,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": _err("get_enclosure_fingerprint", e),
+            "hint": "Is ets-mcp-episode-fields.php 1.4.0+ deployed to "
                     "wp-content/mu-plugins on the ETS subsite?",
         }
 

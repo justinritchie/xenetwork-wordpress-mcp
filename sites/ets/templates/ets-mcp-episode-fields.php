@@ -3,7 +3,7 @@
  * Plugin Name: ETS MCP — Episode Fields (read + guarded write)
  * Description: Exposes per-episode postmeta over REST for the MCP connector, with a
  *              deliberately narrow write path.
- * Version:     1.3.0
+ * Version:     1.4.0
  * Author:      XE Network
  *
  * WHY THIS EXISTS
@@ -47,7 +47,7 @@
 if (!defined('ABSPATH')) { exit; }
 
 if (!defined('ETS_MCP_EPISODE_FIELDS_VERSION')) {
-    define('ETS_MCP_EPISODE_FIELDS_VERSION', '1.3.0');
+    define('ETS_MCP_EPISODE_FIELDS_VERSION', '1.4.0');
 }
 
 /** Only run on the ETS subsite. */
@@ -211,6 +211,32 @@ add_action('rest_api_init', function () {
         'callback' => 'ets_mcp_ef_enclosure_snapshot',
     ));
 
+    // FINGERPRINT — the cheap tripwire for an hourly monitor.
+    //
+    // list_episode_enclosures returns ~213 KB for 295 episodes. That is the
+    // right payload for a human investigation and the wrong one for a task that
+    // runs 15 times a day: every run would blow the tool-output limit and spill
+    // to a temp file, burning context on the fourteen runs where nothing moved.
+    //
+    // Same idiom get_content_fingerprint already documents — store the hash,
+    // compare next run, stop if unchanged — applied to postmeta.
+    //
+    // The hash covers ONLY the state worth alerting on: post_id, the three
+    // enclosure URLs, the three byte lengths, and the paywall flag. Nothing
+    // volatile, so two unchanged runs are byte-identical. modified_gmt is
+    // reported but deliberately NOT hashed: postmeta writes do not reliably bump
+    // it, so including it would make the hash both noisy and unreliable in the
+    // same stroke.
+    register_rest_route('xen-ets/v1', '/episodes/enclosures/fingerprint', array(
+        'methods'             => 'GET',
+        'permission_callback' => function () { return current_user_can('edit_posts'); },
+        'args' => array(
+            'status' => array('type' => 'string',
+                              'description' => 'Same default as the full snapshot.'),
+        ),
+        'callback' => 'ets_mcp_ef_enclosure_fingerprint',
+    ));
+
     // WRITE — one dedicated, guarded route.
     register_rest_route('xen-ets/v1', '/episodes/(?P<id>\d+)/fields', array(
         'methods'             => 'POST',
@@ -327,6 +353,56 @@ function ets_mcp_ef_enclosure_snapshot($req) {
             'blog_id' => get_current_blog_id(),
             'note'    => 'Read-only. Ordered by post_id, serialized settings tail omitted, '
                        . 'so the payload diffs cleanly between runs.',
+        ),
+    );
+}
+
+/**
+ * Small, diff-stable hash of the enclosure + paywall state across all episodes.
+ *
+ * Built from the SAME rows the full snapshot returns, so the two can never
+ * disagree about whether something changed — a fingerprint computed by a
+ * separate query would be a second source of truth and would eventually drift.
+ */
+function ets_mcp_ef_enclosure_fingerprint($req) {
+    $snap = ets_mcp_ef_enclosure_snapshot($req);
+    if (is_wp_error($snap)) { return $snap; }
+
+    $parts  = array();
+    $newest = null;
+    foreach ($snap['episodes'] as $e) {
+        $row = array((string) $e['post_id']);
+        foreach (array('enclosure_public', 'enclosure_member', 'enclosure_member_monthly') as $k) {
+            $enc = $e[$k];
+            $row[] = $enc ? (string) $enc['url'] : '';
+            $row[] = $enc ? (string) $enc['byte_length'] : '';
+        }
+        $row[] = (string) $e['allow_full_episode_for_non_members'];
+        $parts[] = implode("\x1f", $row);
+
+        if ($e['modified_gmt'] && (!$newest || $e['modified_gmt'] > $newest)) {
+            $newest = $e['modified_gmt'];
+        }
+    }
+
+    return array(
+        'ok'                        => true,
+        'fingerprint'               => hash('sha256', implode("\x1e", $parts)),
+        'episode_count'             => count($snap['episodes']),
+        'open_to_non_members'       => $snap['summary']['open_to_non_members'],
+        'open_to_non_members_count' => $snap['summary']['open_to_non_members_count'],
+        'newest_modified_gmt'       => $newest,
+        'statuses'                  => $snap['statuses'],
+        'note'                      => 'Store `fingerprint` and compare next run. Unchanged means no '
+                                     . 'enclosure URL, byte length or paywall flag moved on any episode '
+                                     . '— stop there. On a change, call list_episode_enclosures for the '
+                                     . 'detail. newest_modified_gmt is reported but NOT part of the hash: '
+                                     . 'postmeta writes do not reliably bump it.',
+        '_meta' => array(
+            'plugin'  => 'ets-mcp-episode-fields',
+            'version' => ETS_MCP_EPISODE_FIELDS_VERSION,
+            'blog_id' => get_current_blog_id(),
+            'hashed'  => 'post_id + 3 enclosure urls + 3 byte lengths + paywall flag, per episode',
         ),
     );
 }
