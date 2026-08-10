@@ -3006,6 +3006,137 @@ async def get_enclosure_fingerprint(status: str | None = None) -> dict | str:
                     "wp-content/mu-plugins on the ETS subsite?",
         }
 
+# ---------------------------------------------------------------------------
+# Yoast SEO fields
+#
+# All four are plain postmeta and were already writable through
+# set_episode_fields, so this is convenience — with one thing added that raw
+# meta cannot do. Yoast's primary-term pointers are only meaningful if the term
+# is ACTUALLY ASSIGNED to the post; pointing one at a term the post does not
+# carry produces wrong breadcrumbs and a wrong canonical with no error anywhere.
+# That is not hypothetical drift either: on 9 of 296 episodes
+# _yoast_wpseo_primary_xen_guests already disagrees with guest_link.
+#
+# Note all four keys begin with an underscore, so the mu-plugin's ACF-companion
+# logic correctly skips them — they have no ACF twin and never should.
+# ---------------------------------------------------------------------------
+
+_YOAST_KEYS = {
+    "primary_category": "_yoast_wpseo_primary_category",
+    "primary_guest": "_yoast_wpseo_primary_xen_guests",
+    "meta_description": "_yoast_wpseo_metadesc",
+    "focus_keyphrase": "_yoast_wpseo_focuskw",
+}
+
+
+async def _episode_terms(post_id: int) -> tuple[dict[str, list[dict]] | None, str | None]:
+    """Assigned terms per taxonomy, via the mu-plugin route."""
+    try:
+        r = await client.get(f"{WP_BASE}/wp-json/xen-ets/v1/episodes/{post_id}/terms")
+        if r.status_code == 404:
+            return None, _TERMS_MISSING_HINT
+        r.raise_for_status()
+        return (r.json() or {}).get("terms"), None
+    except Exception as e:  # noqa: BLE001
+        return None, _err("episode_terms", e)
+
+
+@mcp.tool(
+    description=(
+        "Set the four Yoast SEO fields on an episode, checking the ones that can "
+        "be wrong in a way nothing else reports.\n"
+        "\n"
+        "All four are plain postmeta and were already writable through "
+        "set_episode_fields, so the write itself is convenience. The check is not: "
+        "a Yoast PRIMARY TERM only means anything if that term is actually assigned "
+        "to the post. Point it at a term the post does not carry and you get wrong "
+        "breadcrumbs and a wrong canonical URL, with no error in wp-admin, in the "
+        "API, or in Yoast itself. This refuses that write by default.\n"
+        "\n"
+        "Args:\n"
+        "  post_id: the episode.\n"
+        "  primary_category: category term id. Must be one of the post's categories.\n"
+        "  primary_guest: xen_guests term id — find it with list_guests. Must be "
+        "one of the post's assigned guest terms. Set the terms FIRST with "
+        "update_episode(guests=[...]).\n"
+        "  meta_description: the search snippet. Yoast truncates past roughly 156 "
+        "characters; the length is reported either way.\n"
+        "  focus_keyphrase: the target phrase.\n"
+        "  allow_unassigned_primary: write a primary term that is not on the post. "
+        "Only if you are about to assign it.\n"
+        "  dry_run: preview without writing."
+    ),
+)
+async def set_episode_seo(
+    post_id: int,
+    primary_category: int | None = None,
+    primary_guest: int | None = None,
+    meta_description: str | None = None,
+    focus_keyphrase: str | None = None,
+    allow_unassigned_primary: bool = False,
+    dry_run: bool = False,
+) -> dict:
+    supplied = {
+        "primary_category": primary_category,
+        "primary_guest": primary_guest,
+        "meta_description": meta_description,
+        "focus_keyphrase": focus_keyphrase,
+    }
+    if all(v is None for v in supplied.values()):
+        return {"ok": False, "error": "nothing to set — pass at least one field."}
+
+    out: dict = {"post_id": post_id, "validation": {}}
+
+    if primary_category is not None or primary_guest is not None:
+        terms, problem = await _episode_terms(post_id)
+        if terms is None:
+            out["validation"]["skipped"] = (
+                f"Could not read the post's assigned terms, so the primary-term "
+                f"check did not run. {problem}"
+            )
+        else:
+            for param, tax in (("primary_category", "category"),
+                               ("primary_guest", "xen_guests")):
+                want = supplied[param]
+                if want is None:
+                    continue
+                have = [t["id"] for t in (terms.get(tax) or [])]
+                ok = int(want) in have
+                out["validation"][param] = {
+                    "requested": int(want), "assigned_terms": have, "assigned": ok}
+                if not ok and not allow_unassigned_primary:
+                    return {
+                        **out, "ok": False, "persisted": False,
+                        "error": "primary_term_not_assigned",
+                        "message": (
+                            f"Term {want} is not among the post's {tax} terms {have}, so "
+                            f"Yoast would point at a term the post does not carry — wrong "
+                            f"breadcrumbs and canonical, reported by nothing."),
+                        "hint": ("Assign it first with "
+                                 f"update_episode(id={post_id}, "
+                                 + ("guests=[...]" if tax == "xen_guests" else "categories=[...]")
+                                 + "), or pass allow_unassigned_primary=True."),
+                    }
+
+    if meta_description is not None:
+        n = len(meta_description)
+        out["meta_description_length"] = n
+        if n > 156:
+            out["meta_description_note"] = (
+                f"{n} characters — Yoast truncates the search snippet at roughly 156. "
+                "Written as given; shorten it if the tail matters.")
+
+    fields = {_YOAST_KEYS[k]: ("" if v is None else str(v))
+              for k, v in supplied.items() if v is not None}
+    out["fields"] = fields
+    res = await _episode_set_fields(post_id, fields, dry_run=dry_run)
+    out["ok"] = bool(res.get("ok"))
+    out["dry_run"] = bool(dry_run)
+    out["persisted"] = not dry_run
+    out["write_result"] = res
+    return out
+
+
 if __name__ == "__main__":
     print(
         f"[wp-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",

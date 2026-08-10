@@ -70,7 +70,7 @@ EXPECTED = {
     "get_acf_options", "set_acf_options",
     # episode write
     "get_episode_fields", "set_episode_fields", "create_episode",
-    "update_episode", "set_episode_enclosure",
+    "update_episode", "set_episode_enclosure", "set_episode_seo",
     "list_episode_enclosures", "get_enclosure_fingerprint",
 }
 
@@ -84,6 +84,7 @@ HELPERS_THAT_MUST_NOT_BE_TOOLS = {
     "_episode_set_fields", "_term_ids", "_episode_set_terms",
     "_merge_taxonomy_args", "_php_unserialize", "_php_serialize",
     "_rewrite_enclosure_tail", "_hms_to_seconds", "_episode_no_from_title",
+    "_probe_audio_duration", "_seconds_to_hms", "_tail_values", "_episode_terms",
     "_site_labeled_tool", "lifespan",
 }
 
@@ -153,6 +154,9 @@ async def main():
         ("set_episode_enclosure", "duration", "string"),
         ("set_episode_enclosure", "episode_title", "string"),
         ("set_episode_enclosure", "episode_no", "string"),
+        ("set_episode_seo", "primary_category", "integer"),
+        ("set_episode_seo", "primary_guest", "integer"),
+        ("set_episode_seo", "meta_description", "string"),
     ):
         k = kind(tool, param)
         check(f"{tool}.{param} carries a real type", want in k, f"got {k!r}")
