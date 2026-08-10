@@ -3,7 +3,7 @@
  * Plugin Name: ETS MCP — Episode Fields (read + guarded write)
  * Description: Exposes per-episode postmeta and non-REST taxonomies over REST for the
  *              MCP connector, with a deliberately narrow write path.
- * Version:     1.5.0
+ * Version:     1.5.1
  * Author:      XE Network
  *
  * WHY THIS EXISTS
@@ -47,7 +47,7 @@
 if (!defined('ABSPATH')) { exit; }
 
 if (!defined('ETS_MCP_EPISODE_FIELDS_VERSION')) {
-    define('ETS_MCP_EPISODE_FIELDS_VERSION', '1.5.0');
+    define('ETS_MCP_EPISODE_FIELDS_VERSION', '1.5.1');
 }
 
 /** Only run on the ETS subsite. */
@@ -66,6 +66,27 @@ function ets_mcp_ef_is_target_blog() {
  */
 function ets_mcp_ef_denied_keys() {
     return array('_edit_lock', '_edit_last', '_wp_old_slug', '_thumbnail_id');
+}
+
+/**
+ * Keys that legitimately have NO ACF twin, so their absence is not a defect.
+ *
+ * The write path warns when it cannot find an ACF field key for a meta name,
+ * because a value written without its `_<name>` companion renders as an EMPTY
+ * field in wp-admin over a populated database. That warning is worth having.
+ *
+ * It was also firing on `enclosure` every single time, which is a FALSE
+ * POSITIVE: PowerPress owns that key and has no ACF field behind it by design.
+ * A warning that fires on every correct write is a warning nobody reads, which
+ * costs the real ones their meaning — so these are excluded explicitly rather
+ * than by relaxing the check.
+ *
+ * The two `_`-prefixed member tiers are already skipped by the leading-underscore
+ * rule; they are listed anyway so the set reads as one idea and does not depend
+ * on a naming coincidence that could change.
+ */
+function ets_mcp_ef_no_acf_twin_keys() {
+    return array('enclosure', '_member:enclosure', '_member-monthly:enclosure');
 }
 
 /**
@@ -746,8 +767,10 @@ function ets_mcp_ef_write($req) {
     // the source automatically when the target lacks one. Reported, not silent.
     $acf_companions = array();
     $acf_orphans    = array();
+    $no_twin = ets_mcp_ef_no_acf_twin_keys();
     foreach (array_keys($fields) as $k) {
         if (strpos($k, '_') === 0) { continue; }          // already a key row
+        if (in_array($k, $no_twin, true)) { continue; }   // no ACF twin by design
         if (isset($fields['_' . $k]))  { continue; }      // caller supplied it
         $existing_key_row = get_post_meta($id, '_' . $k, true);
         if ($existing_key_row !== '') { continue; }       // target already bound
