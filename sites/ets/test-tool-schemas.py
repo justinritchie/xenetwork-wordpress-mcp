@@ -71,7 +71,7 @@ EXPECTED = {
     # episode write
     "get_episode_fields", "set_episode_fields", "create_episode",
     "update_episode", "set_episode_enclosure", "set_episode_seo",
-    "list_episode_enclosures", "get_enclosure_fingerprint",
+    "list_episode_enclosures", "get_enclosure_fingerprint", "verify_episode",
 }
 
 # Module-level callables that must NEVER appear as tools. If one does, a
@@ -157,6 +157,8 @@ async def main():
         ("set_episode_seo", "primary_category", "integer"),
         ("set_episode_seo", "primary_guest", "integer"),
         ("set_episode_seo", "meta_description", "string"),
+        ("verify_episode", "post_id", "integer"),
+        ("verify_episode", "check_files", "boolean"),
     ):
         k = kind(tool, param)
         check(f"{tool}.{param} carries a real type", want in k, f"got {k!r}")

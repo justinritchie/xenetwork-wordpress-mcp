@@ -3137,6 +3137,361 @@ async def set_episode_seo(
     return out
 
 
+# ---------------------------------------------------------------------------
+# verify_episode — the pre-publish read
+#
+# Read-only. Every other tool here answers "did my write land"; this answers
+# "is this episode actually finished", which is a different question and the one
+# that matters at 8am on release day.
+#
+# The thresholds below are not invented. Each comes from measuring all 296
+# episodes on 2026-08-10, and two of them are the reason certain checks WARN
+# rather than FAIL — a check that fires on a quarter of the legitimate catalog
+# trains people to ignore it.
+# ---------------------------------------------------------------------------
+
+# 86 episodes have no _member-monthly:enclosure. Every one is id <= 1729 except
+# 4429, which is mid-construction — so the tier was introduced partway through
+# the archive and its absence on an old episode is normal, not a defect.
+_MEMBER_MONTHLY_INTRODUCED_AFTER = 1729
+
+# public==member url vs the paywall flag agrees on 281 of 295 episodes. Strong
+# enough to be worth reporting and far too weak to fail on: 11 episodes are
+# flagged open with different files, and 3 are flagged closed with identical
+# ones.
+_PAYWALL_CONSISTENCY = "281 of 295 episodes agree; 14 legitimately do not"
+
+# Measured chapter-end vs member-tier duration: 4447 is 0s apart, 4338 is 1s.
+# 60s is loose enough to absorb a trailing-silence trim and tight enough to
+# catch chapters built against a different cut of the episode.
+_CHAPTER_DRIFT_TOLERANCE_S = 60
+
+
+def _hms_to_seconds(v: str | None) -> int | None:
+    if not v:
+        return None
+    parts = str(v).strip().split(":")
+    if not all(p.strip().isdigit() for p in parts) or not 1 <= len(parts) <= 3:
+        return None
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + int(p)
+    return secs
+
+
+def _tail_values(raw: Any) -> dict:
+    """url / byte_length / mime / the three per-episode tail keys, from one meta value."""
+    parts = str(raw or "").split("\n")
+    out = {
+        "url": parts[0].strip() if parts and parts[0].strip() else None,
+        "byte_length": int(parts[1]) if len(parts) > 1 and parts[1].strip().isdigit() else None,
+        "mime_type": parts[2].strip() if len(parts) > 2 else None,
+        "duration": None, "episode_title": None, "episode_no": None,
+        "has_settings": len(parts) > 3 and bool(parts[3].strip()),
+    }
+    if out["has_settings"]:
+        try:
+            parsed, _ = _php_unserialize(parts[3].encode("utf-8", "surrogateescape"))
+            if isinstance(parsed, dict):
+                for k in _TAIL_PER_EPISODE_KEYS:
+                    v = parsed.get(k)
+                    out[k] = v if isinstance(v, str) else None
+        except Exception:  # noqa: BLE001
+            out["settings_unparseable"] = True
+    return out
+
+
+@mcp.tool(
+    description=(
+        "Is this episode actually ready to publish? Read-only. Returns PASS/FAIL "
+        "plus a per-check breakdown naming exactly what is missing.\n"
+        "\n"
+        "Every other write tool here answers 'did my write land'. This answers a "
+        "different question — whether the episode is COMPLETE — and it is the one "
+        "worth asking before hitting publish, because the things that go wrong are "
+        "silent: a missing guest term, a paywall flag left open, chapters built "
+        "against a different cut of the audio, an enclosure whose byte length "
+        "belongs to the previous episode.\n"
+        "\n"
+        "CHECKS\n"
+        "  categories               non-empty (only 1 published episode has none)\n"
+        "  xen_guests terms         at least one — this is what renders the guest\n"
+        "  guest_link               set, and pointing at a term the post carries\n"
+        "  air_date / recording_date   present, YYYYMMDD\n"
+        "  geek_rating              present, 1-10\n"
+        "  enclosures               all three tiers, each HEAD-checked so the byte "
+        "length is verified against the real file rather than trusted\n"
+        "  enclosure episode_no     matches the post title's [Episode #N]\n"
+        "  episode_chapter_data     parses as JSON and the last chapter ends near "
+        "the member tier's stated duration\n"
+        "  paywall flag             consistent with whether the public file IS the "
+        "full episode\n"
+        "\n"
+        "WARN vs FAIL is calibrated against all 296 episodes, not guessed. Two "
+        "checks only WARN because the live catalog legitimately violates them: "
+        "_member-monthly:enclosure is absent on 86 episodes (every one id<=1729 — "
+        "the tier came later), and the paywall/enclosure correlation holds on 281 "
+        "of 295. A check that fires on a quarter of the real catalog teaches people "
+        "to ignore it.\n"
+        "\n"
+        "ALSO SURFACED: send_email_notification. A '1' arms the new-episode email "
+        "on publish, and new_episode_email_sent records whether it has already "
+        "gone. Neither is a pass/fail condition — both are things you want to know "
+        "BEFORE the post goes live rather than after.\n"
+        "\n"
+        "Args:\n"
+        "  post_id: the episode.\n"
+        "  check_files: HEAD each enclosure URL to verify byte length (default "
+        "true; three requests). False makes it a pure metadata read."
+    ),
+)
+async def verify_episode(post_id: int, check_files: bool = True) -> dict:
+    checks: list[dict] = []
+
+    def add(name, status, detail=None, **extra):
+        checks.append({"check": name, "status": status,
+                       **({"detail": detail} if detail else {}), **extra})
+
+    try:
+        pr = await client.get(f"/episodes/{post_id}", params={"context": "edit"})
+        pr.raise_for_status()
+        post = pr.json()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "post_id": post_id, "error": _err("verify_episode", e)}
+
+    title = (post.get("title") or {}).get("raw") or (post.get("title") or {}).get("rendered")
+    fr = await get_episode_fields(post_id)
+    fields = (fr.get("fields") or {}) if isinstance(fr, dict) else {}
+    if not fields:
+        return {"ok": False, "post_id": post_id, "error": "could not read episode fields",
+                "detail": fr}
+
+    # --- taxonomy -----------------------------------------------------------
+    cats = post.get("categories") or []
+    add("categories", "PASS" if cats else "FAIL",
+        None if cats else "No categories. The episode will not appear in any "
+                          "category listing.", value=cats)
+
+    terms, terms_problem = await _episode_terms(post_id)
+    if terms is None:
+        # class_list carries `xen_guests-<slug>` entries from core REST, so the
+        # check still runs without the mu-plugin — just without term ids.
+        slugs = [c[len("xen_guests-"):] for c in (post.get("class_list") or [])
+                 if c.startswith("xen_guests-")]
+        guest_ids: list[int] = []
+        add("guest terms (xen_guests)", "PASS" if slugs else "FAIL",
+            None if slugs else
+            "No guest term assigned. The guest will not appear on the episode "
+            "page or in /ets/guests/. Assign with update_episode(guests=[...]).",
+            slugs=slugs,
+            # Kept separate from `detail` on purpose: on a FAIL, detail is what
+            # gets surfaced in `failures`, and putting the deployment note there
+            # made a real missing-guest failure read as a tooling problem.
+            degraded="term ids unavailable — read from class_list slugs instead. "
+                     + (terms_problem or ""))
+    else:
+        guest_terms = terms.get("xen_guests") or []
+        guest_ids = [t["id"] for t in guest_terms]
+        add("guest terms (xen_guests)", "PASS" if guest_terms else "FAIL",
+            None if guest_terms else "No guest term assigned. The guest will not "
+                                     "appear on the episode page or in "
+                                     "/ets/guests/. Assign with "
+                                     "update_episode(guests=[...]) — find ids "
+                                     "with list_guests.",
+            terms=[{"id": t["id"], "name": t["name"]} for t in guest_terms])
+
+    guest_link = str(fields.get("guest_link") or "").strip()
+    if not guest_link:
+        add("guest_link", "FAIL",
+            "Empty. The taxonomy term renders the guest; guest_link names the "
+            "PRIMARY guest and the theme reads it. Set it with set_episode_fields.")
+    elif guest_ids and int(guest_link) not in guest_ids:
+        add("guest_link", "FAIL",
+            f"guest_link={guest_link} is not among the assigned guest terms "
+            f"{guest_ids}. Across all 296 episodes there is not one where these "
+            f"disagree.", value=guest_link)
+    else:
+        add("guest_link", "PASS", value=guest_link)
+
+    # --- dates and rating ---------------------------------------------------
+    for key, label in (("air_date", "air_date"), ("recording_date", "recording_date")):
+        v = str(fields.get(key) or "").strip()
+        if not v:
+            add(label, "FAIL", "Missing.")
+        elif not (len(v) == 8 and v.isdigit()):
+            add(label, "FAIL", f"Expected YYYYMMDD, got {v!r}.", value=v)
+        else:
+            add(label, "PASS", value=v)
+
+    gr = str(fields.get("geek_rating") or "").strip()
+    if not gr:
+        add("geek_rating", "FAIL", "Missing.")
+    elif not (gr.isdigit() and 1 <= int(gr) <= 10):
+        add("geek_rating", "FAIL", f"Expected 1-10, got {gr!r}.", value=gr)
+    else:
+        add("geek_rating", "PASS", value=gr)
+
+    # --- enclosures ---------------------------------------------------------
+    expected_no = _episode_no_from_title(title)
+    tiers: dict[str, dict] = {}
+    for tier, key in _ENCLOSURE_KEYS.items():
+        info = _tail_values(fields.get(key))
+        tiers[tier] = info
+        label = f"enclosure [{tier}]"
+
+        if not info["url"]:
+            if tier == "member-monthly" and post_id <= _MEMBER_MONTHLY_INTRODUCED_AFTER:
+                add(label, "WARN", "Absent — normal for this vintage. 86 episodes "
+                                   f"lack this tier and all are id<={_MEMBER_MONTHLY_INTRODUCED_AFTER}.")
+            else:
+                add(label, "FAIL", "No enclosure set for this tier.")
+            continue
+
+        if not info["has_settings"]:
+            add(label, "FAIL", "No serialized settings tail — PowerPress may render "
+                               "no player at all.", url=info["url"])
+            continue
+        if info.get("settings_unparseable"):
+            add(label, "FAIL", "The serialized settings tail does not parse.",
+                url=info["url"])
+            continue
+
+        if check_files:
+            try:
+                hr = await client.head(info["url"], follow_redirects=True, timeout=30.0)
+                cl = hr.headers.get("content-length")
+                actual = int(cl) if cl and cl.isdigit() else None
+                if hr.status_code != 200:
+                    add(label, "FAIL", f"HEAD returned HTTP {hr.status_code} — the file "
+                                       f"may not be uploaded.", url=info["url"])
+                elif actual is None:
+                    add(label, "WARN", "Server returned no Content-Length; byte length "
+                                       "not verified.", url=info["url"])
+                elif actual != info["byte_length"]:
+                    add(label, "FAIL",
+                        f"Stored byte length {info['byte_length']} but the file is "
+                        f"{actual}. This is what a copied enclosure with a swapped URL "
+                        f"looks like — fine in wp-admin, mis-seeking in podcast apps.",
+                        url=info["url"])
+                else:
+                    add(label, "PASS", url=info["url"], byte_length=actual,
+                        duration=info["duration"])
+            except Exception as e:  # noqa: BLE001
+                add(label, "WARN", f"Could not reach the file ({type(e).__name__}); byte "
+                                   f"length not verified.", url=info["url"])
+        else:
+            add(label, "SKIP", "check_files=False — byte length not verified.",
+                url=info["url"], byte_length=info["byte_length"])
+
+        if expected_no is None:
+            add(f"episode_no [{tier}]", "SKIP",
+                f"Post title {title!r} has no '[Episode #N]' prefix to compare against.")
+        elif info["episode_no"] != expected_no:
+            add(f"episode_no [{tier}]", "FAIL",
+                f"The tail says episode {info['episode_no']!r} but the post title says "
+                f"{expected_no!r}. A donor's settings tail was carried without "
+                f"overriding it — this is what publishes the wrong episode number to "
+                f"every podcast app.")
+        else:
+            add(f"episode_no [{tier}]", "PASS", value=expected_no,
+                episode_title=info["episode_title"])
+
+    # --- chapters -----------------------------------------------------------
+    raw_chapters = fields.get("episode_chapter_data")
+    if not str(raw_chapters or "").strip():
+        add("episode_chapter_data", "FAIL", "Missing.")
+    else:
+        try:
+            import json as _json
+            cd = _json.loads(raw_chapters)
+            chapters = cd.get("chapters") or []
+            if not chapters:
+                add("episode_chapter_data", "FAIL", "Parses as JSON but contains no chapters.")
+            else:
+                last_end = max((c.get("endTime") or 0) for c in chapters)
+                # Chapters describe the FULL episode, so the member tier is the
+                # right yardstick; the public tier can be a shorter teaser cut.
+                ref_tier = ("member" if (tiers.get("member") or {}).get("duration")
+                            else "public")
+                ref = _hms_to_seconds((tiers.get(ref_tier) or {}).get("duration"))
+                if ref is None:
+                    add("episode_chapter_data", "WARN",
+                        f"{len(chapters)} chapters ending at {last_end}s, but no tier "
+                        f"states a duration to compare against.")
+                else:
+                    drift = last_end - ref
+                    status = "PASS" if abs(drift) <= _CHAPTER_DRIFT_TOLERANCE_S else "WARN"
+                    add("episode_chapter_data", status,
+                        f"{len(chapters)} chapters; last ends {last_end}s vs the "
+                        f"{ref_tier} tier's {ref}s ({drift:+d}s). Measured drift on "
+                        f"correct episodes is 0-1s; tolerance is "
+                        f"{_CHAPTER_DRIFT_TOLERANCE_S}s."
+                        + ("" if status == "PASS" else " Chapters may have been built "
+                                                       "against a different cut."))
+        except Exception as e:  # noqa: BLE001
+            add("episode_chapter_data", "FAIL", f"Does not parse as JSON: {e}")
+
+    # --- paywall ------------------------------------------------------------
+    paywall = str(fields.get("allow_full_episode_for_non_members") or "").strip()
+    pub_u = (tiers.get("public") or {}).get("url")
+    mem_u = (tiers.get("member") or {}).get("url")
+    if not paywall:
+        add("allow_full_episode_for_non_members", "FAIL",
+            "Unset. This is the flag that decides whether a PAID episode is readable "
+            "by non-members.")
+    elif pub_u and mem_u:
+        public_is_full = pub_u == mem_u or (
+            (tiers["public"]["byte_length"] or 0) == (tiers["member"]["byte_length"] or -1))
+        expected = "Yes" if public_is_full else "No"
+        consistent = paywall.lower() == expected.lower()
+        add("allow_full_episode_for_non_members", "PASS" if consistent else "WARN",
+            (f"Flag is {paywall!r} and the public file "
+             f"{'IS' if public_is_full else 'is NOT'} the member file, which usually "
+             f"means {expected!r}. Correlation only — {_PAYWALL_CONSISTENCY}, so treat "
+             f"this as a prompt to look, not a defect."),
+            value=paywall)
+    else:
+        add("allow_full_episode_for_non_members", "PASS", value=paywall)
+
+    # --- email arming (reported, never graded) ------------------------------
+    send_flag = str(fields.get("send_email_notification") or "").strip()
+    already = fields.get("new_episode_email_sent")
+    email = {
+        "send_email_notification": send_flag or None,
+        "armed": send_flag == "1",
+        "new_episode_email_sent": already or None,
+        "meaning": (
+            "send_email_notification='1' arms the new-episode email to fire when this "
+            "post publishes. new_episode_email_sent is set once it has gone — a value "
+            "there on an unpublished post means the notification is already considered "
+            "sent and the real one would be suppressed."
+        ),
+    }
+    if send_flag == "1" and not already and post.get("status") != "publish":
+        email["note"] = ("Armed and not yet sent. Publishing this post WILL email the "
+                         "list.")
+
+    failures = [c for c in checks if c["status"] == "FAIL"]
+    warnings = [c for c in checks if c["status"] == "WARN"]
+    return {
+        "ok": True,
+        "post_id": post_id,
+        "title": title,
+        "status": post.get("status"),
+        "author": post.get("author"),
+        "link": post.get("link"),
+        "edit_url": f"{WP_BASE}/wp-admin/post.php?post={post_id}&action=edit",
+        "verdict": "FAIL" if failures else "PASS",
+        "counts": {"pass": sum(1 for c in checks if c["status"] == "PASS"),
+                   "fail": len(failures), "warn": len(warnings),
+                   "skip": sum(1 for c in checks if c["status"] == "SKIP")},
+        "failures": [f"{c['check']}: {c.get('detail', '')}" for c in failures],
+        "warnings": [f"{c['check']}: {c.get('detail', '')}" for c in warnings],
+        "checks": checks,
+        "email_notification": email,
+    }
+
+
 if __name__ == "__main__":
     print(
         f"[wp-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",
