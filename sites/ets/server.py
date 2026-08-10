@@ -34,6 +34,7 @@ Run with:
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import sys
@@ -1995,6 +1996,15 @@ def _json_arg(v: Any) -> Any:
     JSON text instead. Returns the value untouched if it is not a string or does
     not parse — a caller passing a genuine string stays intact rather than being
     silently mangled.
+
+    NOTE: this needs `json` imported at MODULE level. It was not, until
+    2026-08-10 — the two `import json as _json` statements elsewhere in this file
+    are function-local and bind a different name, so every call that reached
+    json.loads here raised NameError instead of parsing. NameError is not in the
+    except clause below, so it propagated: the exact string-serialised objects
+    this helper exists to rescue were the ones it broke on, which made the fix in
+    7ea0fd9 a no-op for `taxonomies` and `fields`. `guests`/`categories`/`tags`
+    were unaffected because _term_ids parses them with a regex instead.
     """
     if not isinstance(v, str):
         return v
@@ -2195,6 +2205,295 @@ async def list_guests(
         return r.json()
     except Exception as e:
         return {"ok": False, "error": _err("list_guests", e), "hint": _TERMS_MISSING_HINT}
+
+
+# --- guest term WRITES ----------------------------------------------------------
+#
+# EVERY HELPER FOR THESE TOOLS LIVES ABOVE THE @mcp.tool BLOCKS.
+# A def placed between a decorator and its `async def` binds the decorator to the
+# HELPER: fastmcp registers the helper as the tool and the real function is never
+# registered at all, silently. The tool simply vanishes from the surface.
+
+_GUEST_WRITE_MISSING_HINT = (
+    "The term WRITE routes are not registered on this site. They come from "
+    "ets-mcp-episode-fields.php 1.5.2+ — drop the updated file into "
+    "wp-content/mu-plugins/ on the ETS subsite. A deployment gap, not a "
+    "permissions or code failure. (1.5.1 has the read routes only, so list_guests "
+    "working tells you nothing about the write side.)"
+)
+
+# Measured against this install 2026-08-10 by writing a probe containing every
+# candidate tag and reading the row back out of the database.
+_GUEST_BIO_HTML_NOTE = (
+    "Bios are kses-filtered even for administrators with unfiltered_html, because "
+    "WordPress attaches wp_filter_kses to pre_term_description unconditionally. "
+    "SURVIVE: strong, em, b, i, a (href/title), code, blockquote. STRIPPED: p, br, "
+    "ul, li, div, span, img, script. Separate paragraphs with a blank line, not "
+    "<p>. Bullet lists are flattened into run-together text — do not use them."
+)
+
+
+def _wp_error_payload(res: Any) -> dict | None:
+    """Recognise a WP_Error response body ({code, message, data}) as a failure.
+
+    httpx hands back the JSON either way, and a WP_Error has no `ok` key, so
+    without this a refusal would read as a successful call returning an odd
+    shape — which is exactly how a blocked duplicate would get mistaken for a
+    created term.
+    """
+    if isinstance(res, dict) and res.get("code") and "message" in res and "ok" not in res:
+        return res
+    return None
+
+
+def _compact_candidate(c: dict) -> dict:
+    """One duplicate candidate, trimmed to what decides reuse-or-create."""
+    return {
+        "term_id": c.get("id"),
+        "name": c.get("name"),
+        "slug": c.get("slug"),
+        "episodes": c.get("count"),
+        "similarity": c.get("similarity"),
+        "why": c.get("match_reasons"),
+        "archive": c.get("link"),
+    }
+
+
+async def _terms_write(path: str, payload: dict, stage: str) -> dict:
+    """POST to a mu-plugin term write route, distinguishing missing-route from
+    a real refusal.
+
+    Both arrive as HTTP 404: rest_no_route means the plugin is not deployed,
+    unknown_term means the id is wrong. Telling the caller to go redeploy a
+    mu-plugin because they typo'd a term id would be a bad hour.
+    """
+    try:
+        r = await client.post(f"{WP_BASE}/wp-json/xen-ets/v1/terms/{path}", json=payload)
+        try:
+            body = r.json()
+        except Exception:
+            return {"ok": False, "error": f"non-JSON response (HTTP {r.status_code})",
+                    "body": r.text[:400],
+                    "hint": "A 403 with 'error code: 1010' is Cloudflare blocking the "
+                            "user agent, not WordPress refusing the write."}
+        if isinstance(body, dict) and body.get("code") == "rest_no_route":
+            return {"ok": False, "error": "route_missing", "hint": _GUEST_WRITE_MISSING_HINT}
+        return body
+    except Exception as e:
+        return {"ok": False, "error": _err(stage, e), "hint": _GUEST_WRITE_MISSING_HINT}
+
+
+@mcp.tool(
+    description=(
+        "Create a new ETS podcast GUEST — a term in the `xen_guests` taxonomy. "
+        "This is what makes a guest exist at all; it does not attach them to any "
+        "episode.\n"
+        "\n"
+        "REFUSES DUPLICATES BY DEFAULT, AND THAT IS THE POINT. Before creating "
+        "anything it scans all 262 existing terms and blocks on: exact slug, "
+        "case-insensitive name, accent/punctuation-normalised name, substring "
+        "containment, or a similarity score at or above 85. On a refusal you get "
+        "`existing_candidates` with each term's id, episode count and archive URL "
+        "— reuse the id, do not create a second term.\n"
+        "\n"
+        "WHY IT IS THIS STRICT: a near-duplicate ('Valerie Trouet' and 'Valery "
+        "Trouet') splits one guest's episode archive across two "
+        "/ets/guests/<slug>/ pages. Both terms look healthy, both have episodes, "
+        "and the only symptom is a guest page missing half their shows. A refused "
+        "create is visible immediately; a split archive is not. The threshold is "
+        "measured, not guessed — across all 262 live terms the closest pair of "
+        "genuinely different guests scores 80.0, so 85 blocks none of them.\n"
+        "\n"
+        "ALWAYS CHECK `advisory_same_surname` EVEN ON SUCCESS. Surname matches "
+        "never block (8 surnames are already shared by 2-3 distinct guests), but "
+        "they catch what similarity cannot: 'V. Trouet' scores only 70 against "
+        "'Valerie Trouet' and would sail through.\n"
+        "\n"
+        "SLUG IS PERMANENT IN PRACTICE. It becomes /ets/guests/<slug>/ and terms "
+        "have no _wp_old_slug redirect, so changing it later 404s the archive. "
+        "Leave it unset unless you have a reason; WordPress derives it from the "
+        "name.\n"
+        "\n"
+        + _GUEST_BIO_HTML_NOTE + "\n"
+        "\n"
+        "The write is verified by re-reading the row straight out of the database "
+        "with the object cache bypassed, and reports any tag kses dropped rather "
+        "than claiming a clean save.\n"
+        "\n"
+        "Args:\n"
+        "  name: display name, e.g. 'Valerie Trouet'. REQUIRED.\n"
+        "  slug: optional; derived from name when omitted.\n"
+        "  bio: the guest biography — this is stored as the term description.\n"
+        "  allow_duplicate: override the refusal. Logged to the site error log. "
+        "Only for two genuinely different people with near-identical names.\n"
+        "  dry_run: preview, including whether it would be blocked. Writes nothing.\n"
+        "  taxonomy: defaults to xen_guests."
+    ),
+)
+async def create_guest(
+    name: str,
+    slug: str | None = None,
+    bio: str | None = None,
+    allow_duplicate: bool = False,
+    dry_run: bool = False,
+    taxonomy: str = "xen_guests",
+) -> dict:
+    if not name or not str(name).strip():
+        return {"ok": False, "error": "name is required and cannot be blank."}
+
+    payload: dict = {
+        "name": str(name).strip(),
+        "dry_run": bool(dry_run),
+        "allow_duplicate": bool(allow_duplicate),
+    }
+    if slug is not None and str(slug).strip():
+        payload["slug"] = str(slug).strip()
+    if bio is not None:
+        payload["description"] = str(bio)
+
+    res = await _terms_write(str(taxonomy), payload, "create_guest")
+
+    err = _wp_error_payload(res)
+    if err:
+        data = err.get("data") or {}
+        out: dict = {
+            "ok": False,
+            "error": err.get("code"),
+            "message": err.get("message"),
+            "status": data.get("status"),
+        }
+        if err.get("code") == "duplicate_term":
+            out["existing_candidates"] = [
+                _compact_candidate(c) for c in (data.get("candidates") or [])
+            ]
+            out["advisory_same_surname"] = [
+                _compact_candidate(c) for c in (data.get("advisory") or [])
+            ]
+            out["what_to_do"] = (
+                "Almost always: use the existing term_id above with "
+                "update_episode(guests=[<id>]) instead of creating a second term. "
+                "Only if these really are different people, call again with "
+                "allow_duplicate=True."
+            )
+        else:
+            out["data"] = data
+        return out
+
+    if isinstance(res, dict) and res.get("ok") and not res.get("dry_run"):
+        res["next_steps"] = (
+            "The term now exists but is attached to NOTHING. To put this guest on "
+            "an episode use update_episode(id=<post>, guests=[<term_id>]) — and set "
+            "the ACF guest_link (primary guest) and guest_list (all guests) with "
+            "set_episode_fields, since every one of the 296 live episodes carries "
+            "both the term and the meta."
+        )
+    return res
+
+
+@mcp.tool(
+    description=(
+        "Edit an existing ETS guest — their bio, display name, or slug. Partial "
+        "semantics: anything you do not pass is left exactly as it was.\n"
+        "\n"
+        "THE BIO IS THE TERM DESCRIPTION. Pass `bio` to rewrite it. Find the "
+        "term_id with list_guests.\n"
+        "\n"
+        "REVIEWABLE AND REVERSIBLE. Terms have NO revision history — WordPress "
+        "keeps nothing to roll back to. So this returns `before` and `after` for "
+        "every field it touched, plus a `revert` payload you can hand straight "
+        "back to this tool to undo the change. Capture it before you move on; "
+        "once the response is gone the previous bio is gone with it.\n"
+        "\n"
+        "CHANGING `slug` IS DESTRUCTIVE TO URLS. It rewrites "
+        "/ets/guests/<slug>/, and terms get no _wp_old_slug redirect the way posts "
+        "do — the old URL simply 404s, taking inbound links, the Yoast sitemap "
+        "entry and any show-notes reference with it. The response warns loudly and "
+        "names the episode count. Do not change a slug to fix a typo in a name; "
+        "change the name and leave the slug alone.\n"
+        "\n"
+        + _GUEST_BIO_HTML_NOTE + "\n"
+        "\n"
+        "A rename toward an existing guest's name is REPORTED in `name_candidates` "
+        "but not blocked — renaming is how a typo gets fixed.\n"
+        "\n"
+        "Verified by re-reading the row from the database with the object cache "
+        "bypassed. A byte difference caused purely by entity encoding (& becomes "
+        "&amp;) is reported as lossless and does not raise an alarm; a dropped tag "
+        "does.\n"
+        "\n"
+        "Args:\n"
+        "  term_id: the guest term. REQUIRED. Find it with list_guests.\n"
+        "  name: new display name.\n"
+        "  slug: new slug — breaks the existing archive URL. See above.\n"
+        "  bio: new biography (the term description).\n"
+        "  dry_run: preview before/after and the warnings. Writes nothing.\n"
+        "  taxonomy: defaults to xen_guests."
+    ),
+)
+async def update_guest(
+    term_id: int | str,
+    name: str | None = None,
+    slug: str | None = None,
+    bio: str | None = None,
+    dry_run: bool = False,
+    taxonomy: str = "xen_guests",
+) -> dict:
+    tid = _int_arg(term_id)
+    try:
+        tid = int(tid)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": f"term_id must be an integer, got {term_id!r}."}
+
+    payload: dict = {"dry_run": bool(dry_run)}
+    if name is not None:
+        payload["name"] = str(name)
+    if slug is not None:
+        payload["slug"] = str(slug)
+    if bio is not None:
+        payload["description"] = str(bio)
+
+    if len(payload) == 1:
+        return {
+            "ok": False,
+            "error": "Nothing to update — pass at least one of name, slug or bio.",
+            "hint": "Partial semantics: omitted fields are left alone, so a call with "
+                    "none of them is a no-op. Read the current values with "
+                    "list_guests(include='<term_id>').",
+        }
+
+    res = await _terms_write(f"{taxonomy}/{tid}", payload, "update_guest")
+
+    err = _wp_error_payload(res)
+    if err:
+        data = err.get("data") or {}
+        return {
+            "ok": False,
+            "error": err.get("code"),
+            "message": err.get("message"),
+            "status": data.get("status"),
+            "term_id": tid,
+            "hint": data.get("hint"),
+            "data": {k: v for k, v in data.items() if k not in ("hint",)},
+        }
+
+    # Lift the before/after out of the nested payload so a reviewer sees the
+    # actual edit without digging, and so the revert values are impossible to
+    # miss on the one write that cannot be undone from history.
+    if isinstance(res, dict) and isinstance(res.get("changes"), dict):
+        before = res["changes"].get("before") or {}
+        after = res["changes"].get("after") or res["changes"].get("preview") or {}
+        res["review"] = {
+            "fields_changed": sorted(
+                k for k in ("name", "slug", "description")
+                if k in (res["changes"].get("requested") or {})
+            ),
+            "name": {"before": before.get("name"), "after": after.get("name")},
+            "slug": {"before": before.get("slug"), "after": after.get("slug")},
+            "bio_before": before.get("description"),
+            "bio_after": after.get("description"),
+            "episodes_affected": before.get("count"),
+        }
+    return res
 
 
 @mcp.tool(
