@@ -150,6 +150,9 @@ async def main():
         ("update_episode", "guests", "array"),
         ("update_episode", "taxonomies", "object"),
         ("update_episode", "author", "integer"),
+        ("set_episode_enclosure", "duration", "string"),
+        ("set_episode_enclosure", "episode_title", "string"),
+        ("set_episode_enclosure", "episode_no", "string"),
     ):
         k = kind(tool, param)
         check(f"{tool}.{param} carries a real type", want in k, f"got {k!r}")

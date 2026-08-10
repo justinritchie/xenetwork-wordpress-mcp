@@ -2431,6 +2431,238 @@ _ENCLOSURE_KEYS = {
     "member-monthly": "_member-monthly:enclosure",
 }
 
+# The three keys inside the serialized tail that are definitionally PER-EPISODE.
+# Everything else in there is podcast-wide configuration (value splits, soundbite
+# slots, explicit flag) that is genuinely safe to carry between episodes.
+_TAIL_PER_EPISODE_KEYS = ("duration", "episode_title", "episode_no")
+
+
+class _PhpRaw:
+    """A serialized token this parser models but does not interpret.
+
+    Floats are the case that matters: PHP emits doubles with a precision this
+    code has no reason to try to reproduce, and re-emitting one from a Python
+    float would change bytes that were never asked to change. Holding the
+    original token guarantees an untouched value survives a parse/emit cycle
+    byte-for-byte.
+    """
+
+    __slots__ = ("raw",)
+
+    def __init__(self, raw: bytes):
+        self.raw = raw
+
+
+def _php_unserialize(buf: bytes, i: int = 0) -> tuple[Any, int]:
+    """Minimal PHP unserialize over BYTES. Returns (value, next_index).
+
+    Bytes, not str, because `s:<n>:` counts BYTES. Parsing a UTF-8 string with
+    character indices silently mis-slices the moment a name carries an accent —
+    which is exactly the case a podcast guest list produces.
+    """
+    t = buf[i:i + 1]
+    if t == b"N":
+        if buf[i:i + 2] != b"N;":
+            raise ValueError(f"bad null at {i}")
+        return None, i + 2
+    if t in (b"b", b"i", b"d"):
+        j = buf.index(b";", i)
+        tok = buf[i:j + 1]
+        if t == b"b":
+            return buf[i + 2:j] == b"1", j + 1
+        if t == b"i":
+            return int(buf[i + 2:j]), j + 1
+        return _PhpRaw(tok), j + 1
+    if t == b"s":
+        j = buf.index(b":", i + 2)
+        n = int(buf[i + 2:j])
+        start = j + 2                       # step over ':"'
+        if buf[j + 1:j + 2] != b'"':
+            raise ValueError(f"bad string opener at {j}")
+        val = buf[start:start + n]
+        if buf[start + n:start + n + 2] != b'";':
+            raise ValueError(f"bad string terminator at {start + n} (length prefix wrong?)")
+        return val.decode("utf-8", "surrogateescape"), start + n + 2
+    if t == b"a":
+        j = buf.index(b":", i + 2)
+        n = int(buf[i + 2:j])
+        if buf[j + 1:j + 2] != b"{":
+            raise ValueError(f"bad array opener at {j}")
+        k = j + 2
+        out: dict = {}
+        for _ in range(n):
+            key, k = _php_unserialize(buf, k)
+            val, k = _php_unserialize(buf, k)
+            out[key] = val
+        if buf[k:k + 1] != b"}":
+            raise ValueError(f"bad array terminator at {k}")
+        return out, k + 1
+    raise ValueError(f"unsupported serialized type {t!r} at offset {i}")
+
+
+def _php_serialize(v: Any) -> bytes:
+    if v is None:
+        return b"N;"
+    if isinstance(v, _PhpRaw):
+        return v.raw
+    if isinstance(v, bool):
+        return b"b:1;" if v else b"b:0;"
+    if isinstance(v, int):
+        return b"i:%d;" % v
+    if isinstance(v, str):
+        e = v.encode("utf-8", "surrogateescape")
+        # THE WHOLE POINT: the length prefix counts BYTES. 'Valérie' is 7
+        # characters and 8 bytes, and PHP refuses to unserialize the string if
+        # the prefix says 7 — silently emptying the podcast metadata.
+        return b's:%d:"%s";' % (len(e), e)
+    if isinstance(v, dict):
+        body = b"".join(_php_serialize(k) + _php_serialize(x) for k, x in v.items())
+        return b"a:%d:{%s}" % (len(v), body)
+    raise ValueError(f"cannot serialize {type(v).__name__}")
+
+
+def _rewrite_enclosure_tail(tail: str, overrides: dict[str, str]) -> tuple[str | None, dict]:
+    """Replace per-episode keys inside a serialized PowerPress tail.
+
+    Returns (new_tail_or_None, report). None means REFUSED — the caller must not
+    write, because a tail this code could not prove it understands is worse
+    corrupted than left alone.
+
+    The safety mechanism is a round-trip proof: parse, re-emit unchanged, and
+    require the result to be byte-identical to the input before applying any
+    override. That converts "the parser probably handles this" into a fact
+    checked at call time on the actual data, and it costs one comparison.
+    """
+    if not tail or not tail.strip():
+        return None, {"rewritten": False, "reason": "no serialized tail to rewrite"}
+
+    raw = tail.encode("utf-8", "surrogateescape")
+    try:
+        parsed, end = _php_unserialize(raw, 0)
+    except Exception as e:  # noqa: BLE001
+        return None, {"rewritten": False, "error": "unparseable_tail", "detail": str(e)}
+    if end != len(raw):
+        return None, {"rewritten": False, "error": "trailing_bytes",
+                      "detail": f"parsed {end} of {len(raw)} bytes"}
+    if not isinstance(parsed, dict):
+        return None, {"rewritten": False, "error": "tail_is_not_an_array"}
+
+    if _php_serialize(parsed) != raw:
+        return None, {"rewritten": False, "error": "round_trip_failed",
+                      "detail": "re-serializing the untouched tail did not reproduce it "
+                                "byte-for-byte, so this parser does not fully model it. "
+                                "Refusing rather than writing a tail that may be corrupt."}
+
+    clean = {k: str(v) for k, v in overrides.items() if v is not None}
+    if not clean:
+        return tail, {"rewritten": False, "reason": "no per-episode overrides supplied"}
+
+    before = {k: parsed.get(k) for k in clean}
+    added = [k for k in clean if k not in parsed]
+    parsed.update(clean)
+    return _php_serialize(parsed).decode("utf-8", "surrogateescape"), {
+        "rewritten": True,
+        "before": before,
+        "after": {k: parsed[k] for k in clean},
+        "keys_added": added,
+    }
+
+
+_EPISODE_NO_RE = re.compile(r"^\s*\[\s*Episode\s*#\s*(\d+)\s*\]", re.I)
+
+
+def _episode_no_from_title(title: str | None) -> str | None:
+    """'[Episode #281] – Revisiting the Jet Stream' -> '281'.
+
+    Holds on 11 of 13 sampled episodes; the two misses are a post that is not a
+    numbered episode at all ('[Duke Energy Week extra #1]') and one with no tail
+    yet. Deriving the NUMBER is safe. Deriving the TITLE is not, and this
+    deliberately does not try: the public tier carries a suffix the post title
+    never has — '... [abridged]' or '... (Lagniappe edition)' — while the member
+    tiers carry the bare title. Measured on 4447, where the public tail reads
+    'Revisiting the Jet Stream (Lagniappe edition)' and both member tails read
+    'Revisiting the Jet Stream'. A derived episode_title would quietly overwrite
+    that distinction on every write.
+    """
+    if not title:
+        return None
+    m = _EPISODE_NO_RE.match(title)
+    return m.group(1) if m else None
+
+
+_BITRATES_V1_L3 = [None, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192,
+                   224, 256, 320, None]
+_BITRATES_V2_L3 = [None, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112,
+                   128, 144, 160, None]
+_SAMPLE_RATES = {3: [44100, 48000, 32000], 2: [22050, 24000, 16000],
+                 0: [11025, 12000, 8000]}
+
+
+def _seconds_to_hms(seconds: float) -> str:
+    s = int(round(seconds))
+    return f"{s // 3600}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+async def _probe_audio_duration(url: str) -> tuple[str | None, dict]:
+    """Read the real duration out of the mp3 without downloading it.
+
+    Two range requests: ten bytes for the ID3v2 size, then 8 KB at the first
+    audio frame. The Xing/Info header in that frame carries an exact frame
+    count, so this is not an estimate — verified against four live files whose
+    stored durations it reproduced exactly:
+        4447 public 0:53:29, 4447 member 0:53:29,
+        4338 public 1:47:56, 4338 member 1:48:48.
+    Note those are genuinely different per tier, which is why duration is probed
+    per call rather than once per episode.
+    """
+    try:
+        head = await client.get(url, headers={"Range": "bytes=0-9"}, timeout=30.0)
+        if head.status_code not in (200, 206) or len(head.content) < 10:
+            return None, {"probed": False, "reason": f"range request returned HTTP {head.status_code}"}
+        a = head.content
+        off = 0
+        if a[:3] == b"ID3":
+            off = 10 + (((a[6] & 0x7F) << 21) | ((a[7] & 0x7F) << 14)
+                        | ((a[8] & 0x7F) << 7) | (a[9] & 0x7F))
+            if a[5] & 0x10:                       # footer present
+                off += 10
+        body = await client.get(url, headers={"Range": f"bytes={off}-{off + 8191}"},
+                                timeout=30.0)
+        if body.status_code not in (200, 206):
+            return None, {"probed": False, "reason": f"frame fetch returned HTTP {body.status_code}"}
+        b = body.content
+    except Exception as e:  # noqa: BLE001
+        return None, {"probed": False, "reason": f"{type(e).__name__}: {e}"}
+
+    for i in range(0, min(len(b) - 4, 4096)):
+        if b[i] != 0xFF or (b[i + 1] & 0xE0) != 0xE0:
+            continue
+        b1, b2 = b[i + 1], b[i + 2]
+        ver, layer = (b1 >> 3) & 0x03, (b1 >> 1) & 0x03
+        bri, sri = (b2 >> 4) & 0x0F, (b2 >> 2) & 0x03
+        if layer != 1 or ver == 1 or sri == 3 or bri in (0, 15):
+            continue
+        rate = _SAMPLE_RATES[ver][sri]
+        samples_per_frame = 1152 if ver == 3 else 576
+        for side_info in (32, 17, 9):
+            p = i + 4 + side_info
+            if b[p:p + 4] in (b"Xing", b"Info"):
+                flags = int.from_bytes(b[p + 4:p + 8], "big")
+                if flags & 1:
+                    frames = int.from_bytes(b[p + 8:p + 12], "big")
+                    secs = frames * samples_per_frame / rate
+                    return _seconds_to_hms(secs), {
+                        "probed": True, "method": "Xing/Info frame count",
+                        "seconds": round(secs, 3), "sample_rate": rate,
+                    }
+                break
+        # No VBR header. A CBR estimate is possible but would be wrong by
+        # however large the trailing ID3v1/APE tags are, and a duration that is
+        # quietly a few seconds off is worse than none — the caller can pass it.
+        return None, {"probed": False,
+                      "reason": "no Xing/Info header; refusing to guess a CBR duration"}
+    return None, {"probed": False, "reason": "no MPEG frame header found near the ID3 offset"}
+
 
 @mcp.tool(
     description=(
@@ -2449,7 +2681,26 @@ _ENCLOSURE_KEYS = {
         "\n"
         "The serialized settings tail is carried over from the tier's existing "
         "value, or from `copy_settings_from` — never invented, because it encodes "
-        "per-episode podcast settings that cannot be reconstructed.\n"
+        "podcast settings that cannot be reconstructed.\n"
+        "\n"
+        "THE SECOND FAILURE THIS PREVENTS, and it is silent and user-visible: "
+        "three keys inside that tail are definitionally PER-EPISODE — duration, "
+        "episode_title, episode_no. Carrying a donor's tail verbatim carried "
+        "those too, so post 4447 announced itself as episode 266 with the wrong "
+        "title and runtime on all three tiers, in the feed and in every podcast "
+        "app. This now rewrites them and recomputes the PHP `s:<len>` byte-length "
+        "prefixes (BYTES, not characters — an accented guest name breaks a "
+        "character count and PowerPress then reads an empty settings array).\n"
+        "\n"
+        "  duration       omit and it is PROBED from the file's Xing/Info header "
+        "— exact, not estimated. Durations genuinely differ per tier (4338 is "
+        "1:47:56 public and 1:48:48 member), so it is probed per call.\n"
+        "  episode_no     omit and it is derived from the post title's "
+        "'[Episode #N]' prefix.\n"
+        "  episode_title  NEVER derived. The public tier carries a suffix the "
+        "post title does not — '[abridged]' or '(Lagniappe edition)' — while the "
+        "member tiers carry the bare title. Supply it, or the tier's existing "
+        "value is kept.\n"
         "\n"
         "TIERS — an ETS episode has three:\n"
         "  public          `enclosure`                  the free/teaser file\n"
@@ -2465,7 +2716,10 @@ _ENCLOSURE_KEYS = {
         "  byte_length: omit to use the length reported by the server.\n"
         "  mime_type: defaults to audio/mpeg.\n"
         "  copy_settings_from: episode ID to borrow the serialized settings tail "
-        "from, when this tier has none yet.\n"
+        "from, when this tier has none yet. ALWAYS pass episode_title with this.\n"
+        "  duration: 'H:MM:SS'. Omit to probe the file.\n"
+        "  episode_title: the tail's title for THIS tier.\n"
+        "  episode_no: omit to derive from the post title.\n"
         "  skip_verify: write even if the byte length disagrees with the file. "
         "Only for a file not yet uploaded.\n"
         "  dry_run: show the assembled value, write nothing."
@@ -2478,6 +2732,9 @@ async def set_episode_enclosure(
     byte_length: int | None = None,
     mime_type: str = "audio/mpeg",
     copy_settings_from: int | None = None,
+    duration: str | None = None,
+    episode_title: str | None = None,
+    episode_no: str | None = None,
     skip_verify: bool = False,
     dry_run: bool = False,
 ) -> dict:
@@ -2518,36 +2775,102 @@ async def set_episode_enclosure(
             "hint": f"Use byte_length={actual_len}, or skip_verify=True if you mean it.",
         }
 
-    # Carry the serialized settings tail. Never invented — it encodes per-episode
-    # podcast settings that cannot be reconstructed from anything visible here.
+    # Carry the serialized settings tail. Never invented — it encodes podcast
+    # settings that cannot be reconstructed from anything visible here.
     existing = await get_episode_fields(post_id)
+    existing_fields = (existing.get("fields") or {}) if isinstance(existing, dict) else {}
     tail = ""
-    cur = ((existing.get("fields") or {}).get(key) or "") if isinstance(existing, dict) else ""
+    tail_source = "EMPTY"
+    cur = existing_fields.get(key) or ""
     parts = str(cur).split("\n")
     if len(parts) >= 4 and parts[3].strip():
         tail = parts[3]
+        tail_source = "existing"
     elif copy_settings_from:
         donor = await get_episode_fields(int(copy_settings_from))
         dparts = str(((donor.get("fields") or {}).get(key) or "")).split("\n")
-        if len(dparts) >= 4:
+        if len(dparts) >= 4 and dparts[3].strip():
             tail = dparts[3]
-
-    value = f"{url}\n{int(byte_length)}\n{mime_type}\n{tail}"
+            tail_source = "donor"
 
     out: dict = {
         "post_id": post_id, "tier": tier, "meta_key": key,
         "url": url, "byte_length": int(byte_length), "mime_type": mime_type,
         "byte_length_verified": (actual_len is not None and int(byte_length) == actual_len),
-        "settings_tail": "carried from existing" if (len(parts) >= 4 and parts[3].strip())
-                         else ("carried from donor" if tail else "EMPTY"),
+        "settings_tail": {"existing": "carried from existing",
+                          "donor": "carried from donor"}.get(tail_source, "EMPTY"),
     }
     if head_note:
         out["head_note"] = head_note
+
+    # PER-EPISODE KEYS INSIDE THE TAIL.
+    #
+    # duration/episode_title/episode_no describe THIS episode on THIS tier, and
+    # carrying a donor's tail carried the donor's values with it. That is how
+    # 4447 came to announce itself as episode 266, with 266's title and runtime,
+    # on all three tiers — correct-looking in wp-admin, wrong in every feed.
+    resolved_duration, duration_probe = duration, {"probed": False, "reason": "supplied by caller"}
+    if resolved_duration is None and tail:
+        resolved_duration, duration_probe = await _probe_audio_duration(url)
+
+    resolved_no, no_source = episode_no, "supplied by caller"
+    if resolved_no is None:
+        post_title = None
+        try:
+            pr = await client.get(f"/episodes/{post_id}", params={"context": "edit"})
+            if pr.status_code == 200:
+                t = pr.json().get("title") or {}
+                post_title = t.get("raw") or t.get("rendered")
+        except Exception:  # noqa: BLE001
+            post_title = None
+        resolved_no = _episode_no_from_title(post_title)
+        no_source = f"derived from post title {post_title!r}" if resolved_no else \
+                    "not supplied and not derivable from the post title"
+
+    overrides = {"duration": resolved_duration, "episode_title": episode_title,
+                 "episode_no": resolved_no}
+    out["per_episode_tail_keys"] = {
+        "duration": {"value": resolved_duration, **duration_probe},
+        "episode_no": {"value": resolved_no, "source": no_source},
+        "episode_title": {"value": episode_title,
+                          "source": "supplied by caller" if episode_title
+                                    else f"NOT supplied — keeping the {tail_source} tail's value"},
+    }
+
+    if tail:
+        new_tail, report = _rewrite_enclosure_tail(tail, overrides)
+        out["tail_rewrite"] = report
+        if new_tail is None:
+            return {
+                **out, "ok": False, "persisted": False, "error": "tail_rewrite_refused",
+                "message": "The serialized PowerPress tail could not be safely rewritten, "
+                           "so nothing was written. Writing a tail this code cannot prove "
+                           "it understands would corrupt the podcast metadata worse than "
+                           "leaving it alone.",
+                "hint": "Inspect the raw value with get_episode_fields and fix it in "
+                        "wp-admin, or re-run without duration/episode_title/episode_no "
+                        "to carry the tail verbatim.",
+            }
+        tail = new_tail
+
+    value = f"{url}\n{int(byte_length)}\n{mime_type}\n{tail}"
+
     if not tail:
         out["ATTENTION"] = (
             "No serialized settings tail was available for this tier. PowerPress may "
             "not render the player. Pass copy_settings_from=<an episode that has this "
             "tier> to carry it across."
+        )
+    elif tail_source == "donor" and episode_title is None:
+        # The exact shape of the 4447 bug: a donor tail carried without the one
+        # value that cannot be probed or derived.
+        out["ATTENTION"] = (
+            f"The settings tail came from donor episode {copy_settings_from} and "
+            "episode_title was NOT supplied, so this episode now carries the DONOR'S "
+            "title in its podcast metadata. duration was probed and episode_no was "
+            "derived, but episode_title cannot be — the public tier's title carries a "
+            "suffix ('[abridged]', '(Lagniappe edition)') that the post title does not. "
+            "Re-run with episode_title set."
         )
 
     if dry_run:
