@@ -1,9 +1,9 @@
 <?php
 /**
  * Plugin Name: ETS MCP — Episode Fields (read + guarded write)
- * Description: Exposes per-episode postmeta over REST for the MCP connector, with a
- *              deliberately narrow write path.
- * Version:     1.4.0
+ * Description: Exposes per-episode postmeta and non-REST taxonomies over REST for the
+ *              MCP connector, with a deliberately narrow write path.
+ * Version:     1.5.0
  * Author:      XE Network
  *
  * WHY THIS EXISTS
@@ -47,7 +47,7 @@
 if (!defined('ABSPATH')) { exit; }
 
 if (!defined('ETS_MCP_EPISODE_FIELDS_VERSION')) {
-    define('ETS_MCP_EPISODE_FIELDS_VERSION', '1.4.0');
+    define('ETS_MCP_EPISODE_FIELDS_VERSION', '1.5.0');
 }
 
 /** Only run on the ETS subsite. */
@@ -105,6 +105,40 @@ function ets_mcp_ef_find_field_key($meta_name) {
         '_' . $meta_name
     ));
     return $key ?: null;
+}
+
+/**
+ * Every taxonomy an episode can carry — INCLUDING the ones core REST hides.
+ *
+ * WHY THIS IS NOT A HARDCODED LIST OF ['xen_guests']
+ *   Measured 2026-08-10 on this install: /wp/v2/taxonomies returns only
+ *   category, post_tag, nav_menu and wp_pattern_category, and
+ *   /wp/v2/types/xen_episodes reports taxonomies ['category','post_tag'].
+ *   Both of those endpoints filter by show_in_rest, so a taxonomy registered
+ *   WITHOUT it is invisible to every core route — it does not 404, it simply
+ *   never appears. xen_guests is exactly that case: 261 terms, a public archive
+ *   at /ets/guests/<slug>/, a Yoast sitemap, and no REST surface whatsoever.
+ *
+ *   get_object_taxonomies() reads the registry directly and so sees all of them.
+ *   Deriving the list means a taxonomy added later is covered without another
+ *   round of plugin surgery — the same reasoning behind the exclusion-based
+ *   filtering elsewhere in this MCP.
+ */
+function ets_mcp_ef_episode_taxonomies() {
+    return array_values(get_object_taxonomies('xen_episodes'));
+}
+
+/** Compress a term to the fields a caller actually needs to pick one. */
+function ets_mcp_ef_term_row($t) {
+    return array(
+        'id'          => (int) $t->term_id,
+        'name'        => $t->name,
+        'slug'        => $t->slug,
+        'count'       => (int) $t->count,
+        'taxonomy'    => $t->taxonomy,
+        'description' => $t->description !== '' ? $t->description : null,
+        'link'        => get_term_link($t) instanceof WP_Error ? null : get_term_link($t),
+    );
 }
 
 /**
@@ -251,6 +285,72 @@ add_action('rest_api_init', function () {
                                          'description' => 'Required to write a protected original.'),
         ),
         'callback' => 'ets_mcp_ef_write',
+    ));
+
+    // TAXONOMY DISCOVERY + TERM LISTING.
+    //
+    // xen_guests has no core REST route because it is registered without
+    // show_in_rest, so before this there was NO way to learn a guest's term id
+    // from outside wp-admin — which made assigning one impossible from the MCP
+    // even though the write itself is one wp_set_object_terms() call.
+    //
+    // The route is keyed on taxonomy rather than hardcoded to xen_guests so the
+    // next custom taxonomy needs a parameter, not another endpoint. It refuses
+    // any taxonomy not registered for xen_episodes, which keeps it from becoming
+    // a general-purpose term enumerator over the whole multisite.
+    register_rest_route('xen-ets/v1', '/terms/(?P<taxonomy>[A-Za-z0-9_-]+)', array(
+        'methods'             => 'GET',
+        'permission_callback' => function () { return current_user_can('edit_posts'); },
+        'args' => array(
+            'search'   => array('type' => 'string',
+                                'description' => 'LIKE match against term name AND slug.'),
+            'per_page' => array('type' => 'integer', 'default' => 50),
+            'page'     => array('type' => 'integer', 'default' => 1),
+            'include'  => array('type' => 'string',
+                                'description' => 'Comma-separated term ids — resolve known ids to names.'),
+        ),
+        'callback' => 'ets_mcp_ef_list_terms',
+    ));
+
+    // WHICH TERMS ARE ACTUALLY ON THIS POST.
+    //
+    // core REST answers this for category and post_tag only. class_list happens
+    // to leak the xen_guests SLUGS (as `xen_guests-<slug>` entries), which is
+    // enough to know a guest is attached but not enough to act on — you cannot
+    // reassign, dedupe or compare against guest_link without the ids.
+    register_rest_route('xen-ets/v1', '/episodes/(?P<id>\d+)/terms', array(
+        'methods'             => 'GET',
+        'permission_callback' => function ($req) {
+            return current_user_can('edit_post', (int) $req['id']);
+        },
+        'callback' => 'ets_mcp_ef_read_terms',
+    ));
+
+    // ASSIGN TERMS.
+    //
+    // Kept off the core post route for the same reason meta is: register_taxonomy
+    // with show_in_rest would open a blanket write path on /wp/v2/episodes/<id>
+    // AND add a taxonomy panel to the block editor for every editor on the site.
+    // A dedicated endpoint changes nothing a human sees.
+    //
+    // NOTE FOR MONITORS: wp_set_object_terms() does not bump post_modified, so a
+    // term change is invisible to get_content_fingerprint — same blind spot the
+    // enclosure fingerprint exists to cover for postmeta.
+    register_rest_route('xen-ets/v1', '/episodes/(?P<id>\d+)/terms', array(
+        'methods'             => 'POST',
+        'permission_callback' => function ($req) {
+            return current_user_can('edit_post', (int) $req['id']);
+        },
+        'args' => array(
+            'terms'             => array('required' => true, 'type' => 'object',
+                                         'description' => 'taxonomy => array of term ids.'),
+            'append'            => array('type' => 'boolean', 'default' => false,
+                                         'description' => 'true adds to the existing terms; '
+                                                        . 'false (default) REPLACES them.'),
+            'dry_run'           => array('type' => 'boolean', 'default' => false),
+            'confirm_protected' => array('type' => 'boolean', 'default' => false),
+        ),
+        'callback' => 'ets_mcp_ef_write_terms',
     ));
 
     // Diagnostic — what keys does this install actually use? Answers the question
@@ -405,6 +505,193 @@ function ets_mcp_ef_enclosure_fingerprint($req) {
             'hashed'  => 'post_id + 3 enclosure urls + 3 byte lengths + paywall flag, per episode',
         ),
     );
+}
+
+function ets_mcp_ef_list_terms($req) {
+    $tax     = (string) $req['taxonomy'];
+    $allowed = ets_mcp_ef_episode_taxonomies();
+    if (!in_array($tax, $allowed, true)) {
+        return new WP_Error('unknown_taxonomy', "'{$tax}' is not a taxonomy registered for xen_episodes.", array(
+            'status'    => 400,
+            'available' => $allowed,
+        ));
+    }
+
+    $per_page = max(1, min((int) $req->get_param('per_page'), 200));
+    $page     = max(1, (int) $req->get_param('page'));
+    $search   = trim((string) $req->get_param('search'));
+    $include  = trim((string) $req->get_param('include'));
+
+    $args = array(
+        'taxonomy'   => $tax,
+        'hide_empty' => false,          // a guest booked but not yet aired has count 0
+        'orderby'    => 'name',
+        'order'      => 'ASC',
+        'number'     => $per_page,
+        'offset'     => ($page - 1) * $per_page,
+    );
+    if ($search !== '') { $args['search'] = $search; }
+    if ($include !== '') {
+        $ids = array_values(array_filter(array_map('intval', preg_split('/[\s,]+/', $include))));
+        if ($ids) {
+            // include + a paging offset is a contradiction; resolving specific ids
+            // is a lookup, not a listing, so drop the window rather than silently
+            // returning a slice of it.
+            $args['include'] = $ids;
+            $args['number']  = 0;
+            $args['offset']  = 0;
+            unset($args['search']);
+        }
+    }
+
+    $terms = get_terms($args);
+    if (is_wp_error($terms)) { return $terms; }
+
+    $total = (int) wp_count_terms(array('taxonomy' => $tax, 'hide_empty' => false));
+
+    return array(
+        'ok'       => true,
+        'taxonomy' => $tax,
+        'terms'    => array_map('ets_mcp_ef_term_row', $terms),
+        'returned' => count($terms),
+        'total'    => $total,
+        'page'     => $page,
+        'per_page' => $per_page,
+        '_meta'    => array('plugin' => 'ets-mcp-episode-fields',
+                            'version' => ETS_MCP_EPISODE_FIELDS_VERSION,
+                            'available_taxonomies' => $allowed),
+    );
+}
+
+function ets_mcp_ef_read_terms($req) {
+    $id = (int) $req['id'];
+    if (get_post_type($id) !== 'xen_episodes') {
+        return new WP_Error('not_an_episode', "Post {$id} is not a xen_episodes post.", array('status' => 400));
+    }
+    $out = array();
+    foreach (ets_mcp_ef_episode_taxonomies() as $tax) {
+        $terms = wp_get_object_terms($id, $tax);
+        $out[$tax] = is_wp_error($terms) ? array() : array_map('ets_mcp_ef_term_row', $terms);
+    }
+    return array(
+        'ok'      => true,
+        'post_id' => $id,
+        'terms'   => $out,
+        '_meta'   => array('plugin' => 'ets-mcp-episode-fields',
+                           'version' => ETS_MCP_EPISODE_FIELDS_VERSION),
+    );
+}
+
+function ets_mcp_ef_write_terms($req) {
+    $id      = (int) $req['id'];
+    $terms   = (array) $req->get_param('terms');
+    $append  = filter_var($req->get_param('append'), FILTER_VALIDATE_BOOLEAN);
+    $dry_run = filter_var($req->get_param('dry_run'), FILTER_VALIDATE_BOOLEAN);
+    $confirm = filter_var($req->get_param('confirm_protected'), FILTER_VALIDATE_BOOLEAN);
+
+    if (get_post_type($id) !== 'xen_episodes') {
+        return new WP_Error('not_an_episode', "Post {$id} is not a xen_episodes post.", array('status' => 400));
+    }
+    if (empty($terms)) {
+        return new WP_Error('no_terms', 'terms must be a non-empty object of taxonomy => [ids].', array('status' => 400));
+    }
+
+    $protected = ets_mcp_ef_protected_ids();
+    if (in_array($id, $protected, true)) {
+        if (!$confirm) {
+            return new WP_Error('protected_post', "Post {$id} is a protected original and is never modified.", array(
+                'status' => 409, 'protected_ids' => $protected,
+            ));
+        }
+        error_log(sprintf(
+            '[ets-mcp-episode-fields] PROTECTED OVERRIDE (terms): post %d by user %d; taxonomies: %s',
+            $id, get_current_user_id(), implode(',', array_keys($terms))
+        ));
+    }
+
+    // VALIDATE BEFORE WRITING ANYTHING. wp_set_object_terms() silently drops a
+    // term id that does not exist in the target taxonomy — the call succeeds, the
+    // term is absent, and the caller has no way to tell those apart. Since a term
+    // id typo looks exactly like a correct id, checking first is the difference
+    // between an error and a mystery.
+    $allowed  = ets_mcp_ef_episode_taxonomies();
+    $resolved = array();
+    foreach ($terms as $tax => $ids) {
+        if (!in_array($tax, $allowed, true)) {
+            return new WP_Error('unknown_taxonomy', "'{$tax}' is not registered for xen_episodes.", array(
+                'status' => 400, 'available' => $allowed,
+            ));
+        }
+        $ids = array_values(array_unique(array_map('intval', (array) $ids)));
+        $bad = array();
+        foreach ($ids as $tid) {
+            $t = get_term($tid, $tax);
+            if (!$t || is_wp_error($t)) { $bad[] = $tid; }
+        }
+        if ($bad) {
+            return new WP_Error('unknown_term', 'Term ids not found in this taxonomy.', array(
+                'status' => 400, 'taxonomy' => $tax, 'unknown_ids' => $bad,
+                'hint'   => 'Look ids up with GET /xen-ets/v1/terms/' . $tax . '?search=<name>.',
+            ));
+        }
+        $resolved[$tax] = $ids;
+    }
+
+    $before = array();
+    foreach (array_keys($resolved) as $tax) {
+        $cur = wp_get_object_terms($id, $tax, array('fields' => 'ids'));
+        $before[$tax] = is_wp_error($cur) ? array() : array_map('intval', $cur);
+    }
+
+    if ($dry_run) {
+        return array(
+            'ok' => true, 'dry_run' => true, 'persisted' => false, 'post_id' => $id,
+            'append' => $append,
+            'changes' => array('before' => $before, 'requested' => $resolved),
+            'note' => 'DRY RUN — nothing written.'
+                    . ($append ? '' : ' append=false REPLACES the taxonomy on this post.'),
+        );
+    }
+
+    foreach ($resolved as $tax => $ids) {
+        wp_set_object_terms($id, $ids, $tax, $append);
+    }
+
+    // Verify by re-read. wp_set_object_terms() returns term_taxonomy_ids, not
+    // term_ids, so its return value cannot be compared with what was sent.
+    $after      = array();
+    $mismatched = array();
+    foreach ($resolved as $tax => $ids) {
+        $cur = wp_get_object_terms($id, $tax, array('fields' => 'ids'));
+        $cur = is_wp_error($cur) ? array() : array_map('intval', $cur);
+        $after[$tax] = $cur;
+        $expected_present = $append ? $ids : $ids;
+        if (array_diff($expected_present, $cur)) { $mismatched[] = $tax; }
+        if (!$append && array_diff($cur, $ids)) { $mismatched[] = $tax; }
+    }
+    $mismatched = array_values(array_unique($mismatched));
+
+    $result = array(
+        'ok'        => empty($mismatched),
+        'dry_run'   => false,
+        'persisted' => true,
+        'post_id'   => $id,
+        'append'    => $append,
+        'changes'   => array('before' => $before, 'after' => $after),
+        'integrity' => array(
+            'verified_by_reread' => empty($mismatched),
+            'mismatched_taxonomies' => $mismatched,
+        ),
+        'note' => 'wp_set_object_terms does not bump post_modified — a term change is '
+                . 'invisible to get_content_fingerprint.',
+        '_meta' => array('plugin' => 'ets-mcp-episode-fields',
+                         'version' => ETS_MCP_EPISODE_FIELDS_VERSION),
+    );
+    if (!empty($mismatched)) {
+        $result['ATTENTION'] = 'Re-read does not match what was sent for: '
+                             . implode(', ', $mismatched) . '. Do not assume this landed.';
+    }
+    return $result;
 }
 
 function ets_mcp_ef_write($req) {

@@ -2012,6 +2012,164 @@ def _term_ids(v: Any) -> list[int] | None:
     return out
 
 
+# --- xen_guests and the other taxonomies core REST cannot see --------------------
+#
+# WHAT THE RECON ACTUALLY FOUND (2026-08-10, measured — the ticket's premise was
+# wrong on two counts):
+#
+#   1. xen_guests is a TAXONOMY, not a post type, and it has NO core REST route.
+#      /wp/v2/xen_guests is a 404 rest_no_route. /wp/v2/taxonomies lists only
+#      category, post_tag, nav_menu and wp_pattern_category; /wp/v2/types/
+#      xen_episodes reports taxonomies ['category','post_tag']. Both endpoints
+#      filter by show_in_rest, so a taxonomy registered without it does not error
+#      — it is simply absent, which reads like it does not exist. It does: 261
+#      terms, a public archive at /ets/guests/<slug>/, and its own Yoast sitemap.
+#      Confirmed term ids: Valerie Trouet 564, Nicolas Fulghum 1285.
+#
+#   2. guest_link is NOT an ACF post-object pointing at a guest POST. It holds a
+#      xen_guests TERM ID. On 4338 guest_link='1285' and the assigned term is
+#      xen_guests-nicolas-fulghum (term 1285). There is also guest_list, an ACF
+#      multi-value field holding the full array of term ids — 4425 carries
+#      ['1347','1348'] and has two guest terms attached.
+#
+# HOW THE THREE VALUES RELATE, across all 296 episodes:
+#      guest meta set but NO term relationship .......... 0
+#      term relationship but no guest meta .............. 10 (legacy, pre-ACF)
+#      guest_link != _yoast_wpseo_primary_xen_guests ..... 9
+#      more terms than guest_link accounts for .......... 10 (multi-guest shows)
+#
+#   The taxonomy is the COMPLETE record — it is what renders and what the archive
+#   pages are built from. guest_link is only the primary/featured guest, and
+#   guest_list is the ACF mirror of the full set. They are related but not
+#   derivable from each other, which is why this assigns terms and leaves the ACF
+#   fields to set_episode_fields rather than silently writing both: two writers
+#   for one value is how they drift.
+#
+#   The reason the MCP could never do this before is NOT the write — that is one
+#   wp_set_object_terms() call. It is that with no REST route there was no way to
+#   discover a guest's term id at all. list_guests closes that.
+
+_TERMS_MISSING_HINT = (
+    "The /xen-ets/v1/terms routes are not registered on this site. They come from "
+    "ets-mcp-episode-fields.php 1.5.0+, which has not been deployed yet — drop the "
+    "updated file into wp-content/mu-plugins/ on the ETS subsite. This is a "
+    "deployment gap, not a permissions or code failure."
+)
+
+
+async def _episode_set_terms(
+    post_id: int,
+    terms: dict[str, list[int]],
+    append: bool = False,
+    dry_run: bool = False,
+    confirm_protected: bool = False,
+) -> dict:
+    """POST a taxonomy assignment through the mu-plugin's guarded terms route."""
+    try:
+        r = await client.post(
+            f"{WP_BASE}/wp-json/xen-ets/v1/episodes/{post_id}/terms",
+            json={"terms": terms, "append": bool(append), "dry_run": bool(dry_run),
+                  "confirm_protected": bool(confirm_protected)},
+        )
+        if r.status_code == 404:
+            return {"ok": False, "error": "route_missing", "hint": _TERMS_MISSING_HINT}
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": _err("set_episode_terms", e),
+                "hint": _TERMS_MISSING_HINT}
+
+
+def _merge_taxonomy_args(
+    guests: Any, taxonomies: Any
+) -> tuple[dict[str, list[int]], list[str]]:
+    """Fold the `guests` shorthand into the general `taxonomies` map.
+
+    Returns (map, warnings). category/post_tag are accepted here but flagged:
+    they have dedicated `categories`/`tags` params that go through core REST, and
+    sending them both ways in one call means two writers racing for one value.
+    """
+    out: dict[str, list[int]] = {}
+    warnings: list[str] = []
+
+    if isinstance(taxonomies, dict):
+        for tax, ids in taxonomies.items():
+            coerced = _term_ids(ids)
+            if coerced is None:
+                continue
+            out[str(tax)] = coerced
+
+    g = _term_ids(guests)
+    if g is not None:
+        if "xen_guests" in out and out["xen_guests"] != g:
+            warnings.append(
+                "Both `guests` and taxonomies['xen_guests'] were supplied and they "
+                "disagree. `guests` wins."
+            )
+        out["xen_guests"] = g
+
+    for core_tax, param in (("category", "categories"), ("post_tag", "tags")):
+        if core_tax in out:
+            warnings.append(
+                f"taxonomies['{core_tax}'] was supplied; prefer the `{param}` "
+                f"parameter, which goes through core REST. Passing both in one "
+                f"call gives one value two writers."
+            )
+    return out, warnings
+
+
+@mcp.tool(
+    description=(
+        "List or search ETS podcast GUESTS. Read-only. This is the only way to "
+        "discover a guest's term id.\n"
+        "\n"
+        "Guests are terms in the `xen_guests` TAXONOMY (261 of them), not posts. "
+        "The taxonomy is registered WITHOUT show_in_rest, so it is invisible to "
+        "every core endpoint: /wp/v2/xen_guests is a 404, and /wp/v2/taxonomies "
+        "does not list it. That absence reads like the taxonomy does not exist — "
+        "it does. This tool reads it through the ets-mcp-episode-fields mu-plugin.\n"
+        "\n"
+        "WHY THE TERM MATTERS: the term assignment is what puts the guest on the "
+        "episode page and into /ets/guests/<slug>/. Setting the ACF `guest_link` "
+        "field through set_episode_fields does NOT create it — across all 296 "
+        "episodes there is not one where the meta is set and the term is missing, "
+        "because wp-admin writes both. An MCP write that touches only meta breaks "
+        "that invariant silently.\n"
+        "\n"
+        "Args:\n"
+        "  search: LIKE match against term name AND slug ('trouet', 'fulghum').\n"
+        "  include: comma-separated term ids — the reverse lookup, for turning "
+        "an id already on a post into a name. Ignores search and paging.\n"
+        "  per_page: max 200 (default 50).\n"
+        "  page: 1-indexed.\n"
+        "  taxonomy: defaults to 'xen_guests'. Any taxonomy registered for "
+        "xen_episodes is accepted, so a future custom taxonomy needs no new tool.\n"
+        "\n"
+        "Returns id, name, slug, count (episodes tagged) and archive link. Pass "
+        "the ids to create_episode/update_episode as `guests`."
+    ),
+)
+async def list_guests(
+    search: str | None = None,
+    include: str | None = None,
+    per_page: int = 50,
+    page: int = 1,
+    taxonomy: str = "xen_guests",
+) -> dict | str:
+    params: dict[str, Any] = {"per_page": min(max(per_page, 1), 200), "page": max(page, 1)}
+    if search:
+        params["search"] = search
+    if include:
+        params["include"] = include
+    try:
+        r = await client.get(f"{WP_BASE}/wp-json/xen-ets/v1/terms/{taxonomy}", params=params)
+        if r.status_code == 404:
+            return {"ok": False, "error": "route_missing", "hint": _TERMS_MISSING_HINT}
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"ok": False, "error": _err("list_guests", e), "hint": _TERMS_MISSING_HINT}
+
+
 @mcp.tool(
     description=(
         "Create an episode. Defaults to DRAFT — publishing is always an explicit "
@@ -2037,6 +2195,12 @@ def _term_ids(v: Any) -> list[int] | None:
         "  status: draft (default), publish, pending, future\n"
         "  date: ISO8601 for scheduling; requires status='future'\n"
         "  categories / tags: integer lists\n"
+        "  guests: xen_guests TERM ids — find them with list_guests. This is what "
+        "puts the guest on the page; the ACF guest_link field does not.\n"
+        "  taxonomies: {taxonomy_name: [term_ids]} for anything else custom.\n"
+        "  author: WP user id. Defaults to 4, the id every reference episode "
+        "carries (277 of 296). Left unset, WordPress attributes the post to "
+        "whoever owns the Application Password — id 3 — and the byline is wrong.\n"
         "  fields: the stored-field dict — see get_episode_fields"
     ),
 )
@@ -2056,13 +2220,22 @@ async def create_episode(
     date: str | None = None,
     categories: list[int] | None = None,
     tags: list[int] | None = None,
+    guests: list[int] | None = None,
+    taxonomies: dict[str, list[int]] | None = None,
     featured_media: int | None = None,
+    author: int | None = 4,
     fields: dict[str, Any] | None = None,
 ) -> dict:
     categories = _term_ids(categories)
     tags = _term_ids(tags)
+    tax_map, tax_warnings = _merge_taxonomy_args(guests, taxonomies)
     payload: dict = {"title": title, "content": content,
                      "excerpt": excerpt, "status": status}
+    if author is not None:
+        # Without this the post lands as the Application Password's owner (id 3).
+        # Every reference episode is id 4, so the byline would be wrong on every
+        # MCP-created post and nothing would flag it.
+        payload["author"] = int(author)
     if featured_media is not None:
         # Set through the post route, never via _thumbnail_id meta — two writers
         # for one value is how they drift.
@@ -2092,9 +2265,31 @@ async def create_episode(
         "status": post.get("status"),
         "slug": post.get("slug"),
         "link": post.get("link"),
+        "author": post.get("author"),
         "edit_url": f"{WP_BASE}/wp-admin/post.php?post={new_id}&action=edit",
         "preview_url": f"{WP_BASE}/?p={new_id}&preview=true",
     }
+
+    if tax_map:
+        tr = await _episode_set_terms(new_id, tax_map)
+        out["terms_result"] = tr
+        if tax_warnings:
+            out["terms_warnings"] = tax_warnings
+        if not tr.get("ok"):
+            out["ok"] = False
+            out["ATTENTION"] = (
+                f"Post {new_id} WAS created but its taxonomy terms did not write. The "
+                "guest will not appear on the episode page. See terms_result."
+            )
+        elif "xen_guests" in tax_map and not (fields or {}).get("guest_link"):
+            out["guest_link_note"] = (
+                "Guest TERMS were assigned but the ACF guest_link field was not set in "
+                "this call. Both exist on every one of the 296 live episodes: the term "
+                "renders the guest and the archive, guest_link names the PRIMARY guest "
+                "(and guest_list mirrors the full set on multi-guest shows). Set them "
+                "with set_episode_fields — guest_link=<primary term id>, and guest_list "
+                "as a list of ids if there is more than one."
+            )
 
     if fields:
         clean = {k: v for k, v in dict(fields).items() if k not in _EPISODE_DO_NOT_COPY}
@@ -2130,9 +2325,19 @@ async def create_episode(
         "are handled automatically. Status changes are explicit — this never "
         "publishes something that was a draft unless you pass status='publish'.\n"
         "\n"
+        "TAXONOMY TERMS: `guests` takes xen_guests TERM ids (find them with "
+        "list_guests) and REPLACES the guest set on the post unless "
+        "append_terms=True. That taxonomy has no core REST route, so this is the "
+        "only write path for it. Note it does NOT bump post_modified — a term "
+        "change is invisible to get_content_fingerprint.\n"
+        "\n"
         "Args:\n"
         "  id: REQUIRED.\n"
         "  title, content, excerpt, slug, status, date, categories, tags: any subset.\n"
+        "  guests: xen_guests term ids.\n"
+        "  taxonomies: {taxonomy_name: [term_ids]} for anything else custom.\n"
+        "  append_terms: add to the existing terms instead of replacing them.\n"
+        "  author: WP user id — pass 4 to correct a post created as id 3.\n"
         "  fields: stored-field dict.\n"
         "  confirm_protected: override the protected-original guard. Logged loudly."
     ),
@@ -2147,12 +2352,17 @@ async def update_episode(
     date: str | None = None,
     categories: list[int] | None = None,
     tags: list[int] | None = None,
+    guests: list[int] | None = None,
+    taxonomies: dict[str, list[int]] | None = None,
+    append_terms: bool = False,
     featured_media: int | None = None,
+    author: int | None = None,
     fields: dict[str, Any] | None = None,
     confirm_protected: bool = False,
 ) -> dict:
     categories = _term_ids(categories)
     tags = _term_ids(tags)
+    tax_map, tax_warnings = _merge_taxonomy_args(guests, taxonomies)
     payload: dict = {}
     for k, v in (("title", title), ("content", content), ("excerpt", excerpt),
                  ("slug", slug), ("status", status), ("date", date)):
@@ -2164,6 +2374,8 @@ async def update_episode(
         payload["tags"] = [int(t) for t in tags]
     if featured_media is not None:
         payload["featured_media"] = int(featured_media)
+    if author is not None:
+        payload["author"] = int(author)
 
     out: dict = {"ok": True, "id": id}
     headers = {"X-ETS-Confirm-Protected": "yes"} if confirm_protected else None
@@ -2185,6 +2397,17 @@ async def update_episode(
         out.update({"status": post.get("status"), "slug": post.get("slug"),
                     "link": post.get("link"), "updated": sorted(payload.keys())})
 
+    if tax_map:
+        tr = await _episode_set_terms(
+            id, tax_map, append=append_terms, confirm_protected=confirm_protected
+        )
+        out["terms_result"] = tr
+        if tax_warnings:
+            out["terms_warnings"] = tax_warnings
+        if not tr.get("ok"):
+            out["ok"] = False
+            out["ATTENTION"] = "Term write did not verify — see terms_result."
+
     if fields:
         fr = await _episode_set_fields(id, dict(fields))
         out["fields_result"] = fr
@@ -2192,7 +2415,7 @@ async def update_episode(
             out["ok"] = False
             out["ATTENTION"] = "Field write did not verify — see fields_result.integrity."
 
-    if not payload and not fields:
+    if not payload and not fields and not tax_map:
         return {"ok": False, "id": id, "error": "nothing to update — pass at least one field."}
     return out
 
