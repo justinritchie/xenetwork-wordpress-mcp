@@ -1987,6 +1987,33 @@ async def set_episode_fields(post_id: int, fields: dict, dry_run: bool = False) 
     return await _episode_set_fields(post_id, dict(fields), dry_run=dry_run)
 
 
+def _json_arg(v: Any) -> Any:
+    """Parse a param that arrived as a JSON string instead of a real object.
+
+    Needed because mcp-remote flattens anyOf schemas to {} in transit, so a
+    conforming client cannot tell that `fields` wants an object and sends the
+    JSON text instead. Returns the value untouched if it is not a string or does
+    not parse — a caller passing a genuine string stays intact rather than being
+    silently mangled.
+    """
+    if not isinstance(v, str):
+        return v
+    s = v.strip()
+    if not s or s[0] not in "{[":
+        return v
+    try:
+        return json.loads(s)
+    except (ValueError, TypeError):
+        return v
+
+
+def _int_arg(v: Any) -> Any:
+    """Coerce an int param that arrived as a string. Leaves anything else alone."""
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
+    return v
+
+
 def _term_ids(v: Any) -> list[int] | None:
     """Coerce a taxonomy term argument into a list of ints, or None.
 
@@ -2218,16 +2245,20 @@ async def create_episode(
     slug: str | None = None,
     status: str = "draft",
     date: str | None = None,
-    categories: list[int] | None = None,
-    tags: list[int] | None = None,
-    guests: list[int] | None = None,
-    taxonomies: dict[str, list[int]] | None = None,
+    categories: list[int] | str | None = None,
+    tags: list[int] | str | None = None,
+    guests: list[int] | str | None = None,
+    taxonomies: dict[str, list[int]] | str | None = None,
     featured_media: int | None = None,
-    author: int | None = 4,
-    fields: dict[str, Any] | None = None,
+    author: int | str | None = 4,
+    fields: dict[str, Any] | str | None = None,
 ) -> dict:
     categories = _term_ids(categories)
     tags = _term_ids(tags)
+    guests = _term_ids(guests)
+    taxonomies = _json_arg(taxonomies)
+    fields = _json_arg(fields)
+    author = _int_arg(author)
     tax_map, tax_warnings = _merge_taxonomy_args(guests, taxonomies)
     payload: dict = {"title": title, "content": content,
                      "excerpt": excerpt, "status": status}
@@ -2350,18 +2381,22 @@ async def update_episode(
     slug: str | None = None,
     status: str | None = None,
     date: str | None = None,
-    categories: list[int] | None = None,
-    tags: list[int] | None = None,
-    guests: list[int] | None = None,
-    taxonomies: dict[str, list[int]] | None = None,
+    categories: list[int] | str | None = None,
+    tags: list[int] | str | None = None,
+    guests: list[int] | str | None = None,
+    taxonomies: dict[str, list[int]] | str | None = None,
     append_terms: bool = False,
     featured_media: int | None = None,
-    author: int | None = None,
-    fields: dict[str, Any] | None = None,
+    author: int | str | None = None,
+    fields: dict[str, Any] | str | None = None,
     confirm_protected: bool = False,
 ) -> dict:
     categories = _term_ids(categories)
     tags = _term_ids(tags)
+    guests = _term_ids(guests)
+    taxonomies = _json_arg(taxonomies)
+    fields = _json_arg(fields)
+    author = _int_arg(author)
     tax_map, tax_warnings = _merge_taxonomy_args(guests, taxonomies)
     payload: dict = {}
     for k, v in (("title", title), ("content", content), ("excerpt", excerpt),
