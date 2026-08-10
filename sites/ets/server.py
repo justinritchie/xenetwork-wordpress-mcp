@@ -1987,6 +1987,31 @@ async def set_episode_fields(post_id: int, fields: dict, dry_run: bool = False) 
     return await _episode_set_fields(post_id, dict(fields), dry_run=dry_run)
 
 
+def _term_ids(v: Any) -> list[int] | None:
+    """Coerce a taxonomy term argument into a list of ints, or None.
+
+    Belt and braces alongside the list[int] annotation. Accepts the shapes a
+    confused client might send — [111, 1145], "111,1145", "[111, 1145]", 111 —
+    because a tool that hard-fails on a guessable serialisation is a tool the
+    caller cannot use. Returns None for None so "not supplied" stays
+    distinguishable from "supplied empty", which for update_episode is the
+    difference between leaving terms alone and clearing them.
+    """
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return [v]
+    if isinstance(v, str):
+        v = [p for p in re.split(r"[,\s]+", v.strip().strip("[]")) if p]
+    out: list[int] = []
+    for item in v:
+        try:
+            out.append(int(str(item).strip()))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 @mcp.tool(
     description=(
         "Create an episode. Defaults to DRAFT — publishing is always an explicit "
@@ -2015,6 +2040,13 @@ async def set_episode_fields(post_id: int, fields: dict, dry_run: bool = False) 
         "  fields: the stored-field dict — see get_episode_fields"
     ),
 )
+# NOTE: categories/tags/fields MUST carry parameterised annotations
+# (list[int], dict[str, Any]) rather than bare list/dict. A bare annotation
+# generates the EMPTY JSON schema {}, which tells every MCP client the parameter
+# is untyped; well-behaved clients then serialise the value as a string and the
+# Python-side list validator rejects it. The schema and the validator disagree
+# and the parameter becomes unreachable from any client. Found 2026-08-10 while
+# publishing Episode #281 — categories and tags could not be set at all.
 async def create_episode(
     title: str,
     content: str = "",
@@ -2022,11 +2054,13 @@ async def create_episode(
     slug: str | None = None,
     status: str = "draft",
     date: str | None = None,
-    categories: list | None = None,
-    tags: list | None = None,
+    categories: list[int] | None = None,
+    tags: list[int] | None = None,
     featured_media: int | None = None,
-    fields: dict | None = None,
+    fields: dict[str, Any] | None = None,
 ) -> dict:
+    categories = _term_ids(categories)
+    tags = _term_ids(tags)
     payload: dict = {"title": title, "content": content,
                      "excerpt": excerpt, "status": status}
     if featured_media is not None:
@@ -2111,12 +2145,14 @@ async def update_episode(
     slug: str | None = None,
     status: str | None = None,
     date: str | None = None,
-    categories: list | None = None,
-    tags: list | None = None,
+    categories: list[int] | None = None,
+    tags: list[int] | None = None,
     featured_media: int | None = None,
-    fields: dict | None = None,
+    fields: dict[str, Any] | None = None,
     confirm_protected: bool = False,
 ) -> dict:
+    categories = _term_ids(categories)
+    tags = _term_ids(tags)
     payload: dict = {}
     for k, v in (("title", title), ("content", content), ("excerpt", excerpt),
                  ("slug", slug), ("status", status), ("date", date)):
