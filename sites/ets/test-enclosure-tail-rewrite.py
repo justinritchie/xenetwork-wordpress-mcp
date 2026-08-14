@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["fastmcp>=3.2,<4", "httpx>=0.27.0", "mcp"]
+# dependencies = ["fastmcp>=3.2,<4", "httpx>=0.27.0,<1.0", "mcp"]
 # ///
 """Unit tests for the PowerPress serialized-tail rewrite. No network.
 
