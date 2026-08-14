@@ -7,7 +7,7 @@ Description: Surfaces s2Member's user metadata + custom registration fields
              timestamps, gateway IDs, login counts, and custom fields.
              Read-only; only exposes fields when context=edit (auth required).
 Author: Justin Ritchie
-Version: 1.2.1
+Version: 1.3.0
 */
 
 if (!defined('ABSPATH')) {
@@ -1112,6 +1112,15 @@ function xen_set_access_writable_keys() {
         $wpdb->base_prefix . 's2member_subscr_id',
         $wpdb->base_prefix . 's2member_subscr_gateway',
         'xen_mcp_access_audit',
+        // ccap writes, reachable ONLY through remove_ccap / add_ccap. Their
+        // absence from this list was the root cause of the silent-failure bug:
+        // preserve_ccaps=false modelled a change to stores the endpoint had no
+        // permission or code to touch. Inside the capability blobs only the
+        // access_s2member_ccap_* entries move; the role key is rewritten solely
+        // when `level` is supplied, and no other capability is ever altered.
+        'ccaps',
+        $wpdb->base_prefix . 'capabilities [access_s2member_ccap_* only]',
+        $wpdb->base_prefix . 'N_capabilities [access_s2member_ccap_* only; removal scans every subsite blob]',
     ];
 }
 
@@ -1463,6 +1472,149 @@ function xen_set_access_ccaps_in($caps) {
     return $out;
 }
 
+// ---------------------------------------------------------------------------
+// ccap add/remove — the two stores, and why both must move together
+// ---------------------------------------------------------------------------
+//
+// list_users_by_ccap (see /users/export-by-ccap above) reads the UNION of:
+//
+//   1. the flat `ccaps` usermeta key      — a delimited slug list, e.g. "secant"
+//   2. access_s2member_ccap_<slug> inside the capability blobs
+//
+// so a removal that touches one store and not the other does not remove the
+// member from the roster — it makes the two sources disagree, which surfaces as
+// only_in_ccaps_meta / only_in_capabilities. That state is detectable, and
+// wrong, and there are already 298 users in it from other causes. Every write
+// below moves both stores or neither.
+//
+// WHICH BLOBS — measured 2026-08-14, not assumed. The ccap's location varies by
+// membership state, so neither "root only" nor "all blobs" is correct:
+//
+//   user 11900 (active, level2): access_s2member_ccap_secant in wp_capabilities
+//                                ONLY. wp_2_/wp_3_/wp_4_ hold just the role.
+//   user  3851 (demoted at EOT): ccap STRIPPED from wp_capabilities, but alive
+//                                in wp_2_, wp_3_ AND wp_4_capabilities.
+//
+// Hence the asymmetry, which is deliberate:
+//
+//   REMOVE scans EVERY blob. Removing from the root alone would leave a
+//          demoted member on the roster via the subsite blobs — the exact
+//          shape user 3851 is in.
+//   ADD    writes the ROOT blob only, because that is the shape s2Member
+//          itself creates for an active member. Mirroring a grant into the
+//          subsite blobs would invent state s2Member never creates, the same
+//          reason the subscription-identity write below stays on base_prefix.
+//
+// The flat `ccaps` key moves in both directions regardless — it is the store
+// that survives demotion and the roster's primary source.
+
+/**
+ * Normalise a ccap argument into bare lowercase slugs.
+ *
+ * Accepts "a", "a,b", "a b", "a|b", '["a","b"]', or a real array, because
+ * mcp-remote flattens anyOf schemas in transit and a caller genuinely cannot
+ * tell which shape this wants. Also tolerates a full capability key
+ * (access_s2member_ccap_uva -> uva): every response in this file reports ccaps
+ * in cap-key form, so a caller pasting one straight back is the expected
+ * mistake, not an exotic one.
+ *
+ * Returns ['slugs' => [...], 'invalid' => [...]]. Invalid input is REPORTED,
+ * never dropped — silently discarding a malformed slug would turn "remove
+ * dartmouth" into a no-op that still reports success.
+ */
+function xen_ccap_parse_arg($raw) {
+    if ($raw === null || $raw === '' || $raw === []) {
+        return ['slugs' => [], 'invalid' => []];
+    }
+    if (is_string($raw)) {
+        $t = trim($raw);
+        $decoded = json_decode($t, true);
+        $raw = is_array($decoded) ? $decoded : preg_split('/[\s,|]+/', $t);
+    }
+    if (!is_array($raw)) {
+        $raw = [$raw];
+    }
+    $slugs = [];
+    $invalid = [];
+    foreach ($raw as $v) {
+        $v = strtolower(trim((string) $v));
+        $v = trim($v, " \t\n\r\0\x0B[]\"'");
+        if ($v === '') {
+            continue;
+        }
+        if (strpos($v, 'access_s2member_ccap_') === 0) {
+            $v = substr($v, strlen('access_s2member_ccap_'));
+        }
+        if (!preg_match('~^[a-z0-9_\-]+$~', $v)) {
+            $invalid[] = $v;
+            continue;
+        }
+        $slugs[$v] = true;
+    }
+    return ['slugs' => array_keys($slugs), 'invalid' => $invalid];
+}
+
+/** Split the flat `ccaps` usermeta value into slugs, original order kept. */
+function xen_ccap_flat_split($value) {
+    $out = [];
+    foreach (preg_split('/[\s,|]+/', (string) $value) as $c) {
+        $c = strtolower(trim($c));
+        if ($c !== '' && !in_array($c, $out, true)) {
+            $out[] = $c;
+        }
+    }
+    return $out;
+}
+
+/**
+ * The flat `ccaps` value after removals and additions.
+ *
+ * PURE, and called by BOTH the dry-run plan and the write. That is not tidiness
+ * — it is how the dry run is kept honest. The previous bug was a plan that
+ * modelled an outcome the write did not implement; two code paths computing the
+ * same answer separately is exactly how that reappears. One function, two
+ * callers, so the prediction cannot drift from the result.
+ *
+ * Slugs the caller did not name are preserved verbatim, which is the whole
+ * point on a multi-ccap account.
+ */
+function xen_ccap_flat_apply($current, array $remove, array $add) {
+    $out = [];
+    foreach (xen_ccap_flat_split($current) as $c) {
+        if (!in_array($c, $remove, true)) {
+            $out[] = $c;
+        }
+    }
+    foreach ($add as $c) {
+        if (!in_array($c, $out, true)) {
+            $out[] = $c;
+        }
+    }
+    return implode(',', $out);
+}
+
+/** The capability-key ccap set after removals and additions. Pure; same rule. */
+function xen_ccap_caps_apply(array $before_keys, array $remove, array $add) {
+    $strip = [];
+    foreach ($remove as $s) {
+        $strip['access_s2member_ccap_' . $s] = true;
+    }
+    $out = [];
+    foreach ($before_keys as $k) {
+        if (!isset($strip[$k]) && !in_array($k, $out, true)) {
+            $out[] = $k;
+        }
+    }
+    foreach ($add as $s) {
+        $k = 'access_s2member_ccap_' . $s;
+        if (!in_array($k, $out, true)) {
+            $out[] = $k;
+        }
+    }
+    sort($out);
+    return $out;
+}
+
 function xen_users_set_access($request) {
     global $wpdb;
 
@@ -1482,15 +1634,21 @@ function xen_users_set_access($request) {
     // operator can trust it before touching a live membership. Refusing the
     // argument is the honest failure: the caller learns immediately, instead
     // of reading "applied" over an unchanged record.
+    // Still refused now that removal EXISTS, and deliberately so. A boolean
+    // cannot say WHICH ccap to drop, so on a multi-ccap account it can only
+    // mean "remove all of them" — an irreversible superset of what the caller
+    // usually wants, expressed by a flag that reads like a safety toggle.
+    // remove_ccap names its target; the flag stays refused rather than being
+    // quietly rehabilitated into an alias for it.
     if ($preserve_ccaps === false) {
         return new WP_Error(
             'preserve_ccaps_unsupported',
-            'preserve_ccaps=false is not implemented — this endpoint has never been '
-            . 'able to remove a ccap, and honouring the flag halfway would report a '
-            . 'removal that did not happen. Ccaps are always preserved here. To take '
-            . 'a member off a group roster, remove BOTH the s2Member capability and '
-            . 'the `ccaps` field in wp-admin; removing only one leaves the roster '
-            . 'export disagreeing with itself.',
+            'preserve_ccaps=false is not implemented and is refused rather than ignored '
+            . '(it used to be accepted, predicted in the dry run, and silently dropped). '
+            . 'Use remove_ccap="<slug>" to take a specific ccap off a member — it names '
+            . 'its target, and it updates BOTH the `ccaps` usermeta key and the '
+            . 'access_s2member_ccap_* entry in every capability blob, which is what '
+            . 'actually removes someone from a roster.',
             ['status' => 400]
         );
     }
@@ -1630,12 +1788,59 @@ function xen_users_set_access($request) {
             $ccaps_before = array_merge($ccaps_before, $b['ccaps']);
         }
         $ccaps_before = array_values(array_unique($ccaps_before));
+        sort($ccaps_before); // stable order, so prediction and readback compare cleanly
+
+        // --- ccap add / remove ----------------------------------------------
+        $want_rm  = array_key_exists('remove_ccap', $row) ? $row['remove_ccap'] : $request->get_param('remove_ccap');
+        $want_add = array_key_exists('add_ccap', $row)    ? $row['add_ccap']    : $request->get_param('add_ccap');
+
+        $parsed_rm  = xen_ccap_parse_arg($want_rm);
+        $parsed_add = xen_ccap_parse_arg($want_add);
+        if ($parsed_rm['invalid'] || $parsed_add['invalid']) {
+            $plans[] = ['identifier' => $ident, 'user_id' => $u->ID, 'status' => 'invalid_ccap'];
+            $fatal[] = "row {$i}: not valid ccap slugs (lowercase letters, digits, - and _ only): "
+                     . implode(', ', array_merge($parsed_rm['invalid'], $parsed_add['invalid']));
+            continue;
+        }
+        $rm_slugs  = $parsed_rm['slugs'];
+        $add_slugs = $parsed_add['slugs'];
+
+        // Naming the same slug on both sides has no defensible reading, and
+        // guessing an order would make the result depend on an implementation
+        // detail the caller cannot see.
+        $both = array_values(array_intersect($rm_slugs, $add_slugs));
+        if ($both) {
+            $plans[] = ['identifier' => $ident, 'user_id' => $u->ID, 'status' => 'ccap_conflict'];
+            $fatal[] = "row {$i}: " . implode(', ', $both)
+                     . ' appears in BOTH remove_ccap and add_ccap. Refusing rather than picking an order.';
+            continue;
+        }
+
+        $flat_before = (string) get_user_meta($u->ID, 'ccaps', true);
+        // Both predictions come from the pure helpers the WRITE also calls, so
+        // the dry run cannot promise an outcome the write will not produce.
+        $ccaps_after_pred = xen_ccap_caps_apply($ccaps_before, $rm_slugs, $add_slugs);
+        $flat_after_pred  = xen_ccap_flat_apply($flat_before, $rm_slugs, $add_slugs);
+
+        // A requested removal of a ccap the member does not hold is a no-op, not
+        // an error — but it is reported, because "nothing to remove" and
+        // "removed" look identical in an empty result and the difference is
+        // whether the operator targeted the right person.
+        $rm_noop = [];
+        foreach ($rm_slugs as $s) {
+            $in_caps = in_array('access_s2member_ccap_' . $s, $ccaps_before, true);
+            $in_flat = in_array($s, xen_ccap_flat_split($flat_before), true);
+            if (!$in_caps && !$in_flat) {
+                $rm_noop[] = $s;
+            }
+        }
 
         // Now that every field is parsed, decide whether anything was asked for.
-        if ($new_role === null && !empty($eot['skip']) && $new_sid === null && $new_gw === null) {
+        if ($new_role === null && !empty($eot['skip']) && $new_sid === null && $new_gw === null
+            && !$rm_slugs && !$add_slugs) {
             $plans[] = ['identifier' => $ident, 'user_id' => $u->ID, 'status' => 'nothing_requested'];
             $fatal[] = "row {$i}: nothing supplied — needs at least one of "
-                     . 'level, auto_eot, subscr_id or subscr_gateway.';
+                     . 'level, auto_eot, subscr_id, subscr_gateway, remove_ccap or add_ccap.';
             continue;
         }
 
@@ -1643,6 +1848,8 @@ function xen_users_set_access($request) {
         $eot_changes  = !empty($eot['skip']) ? false : ((string) $old_eot !== (string) $eot['value']);
         $sid_changes  = ($new_sid !== null) && ((string) $old_sid !== (string) $new_sid);
         $gw_changes   = ($new_gw !== null)  && ((string) $old_gw  !== (string) $new_gw);
+        $ccap_changes = ($ccaps_after_pred !== $ccaps_before)
+                        || ($flat_after_pred !== $flat_before);
 
         $plans[] = [
             'identifier'      => $ident,
@@ -1664,13 +1871,28 @@ function xen_users_set_access($request) {
             'ccaps_before'    => $ccaps_before,
             // Not `$preserve_ccaps ? $ccaps_before : []`. That ternary was the
             // lie: its false branch promised an empty ccap set that no code
-            // path could produce. preserve_ccaps=false is now refused above, so
-            // the prediction is unconditional and matches the write by
-            // construction rather than by coincidence.
-            'ccaps_after'     => $ccaps_before,
-            'flat_ccaps_meta' => get_user_meta($u->ID, 'ccaps', true) ?: null,
+            // path could produce. This is now computed by the same pure helper
+            // the write calls, so prediction and result agree by construction
+            // rather than by coincidence.
+            'ccaps_after'     => $ccaps_after_pred,
+            'flat_ccaps_meta' => $flat_before === '' ? null : $flat_before,
+            // Reported in the DRY RUN too, not just after a write. The whole
+            // failure this replaces was a preview that omitted the store it
+            // could not change.
+            'flat_ccaps_meta_after' => $flat_after_pred === '' ? null : $flat_after_pred,
+            'ccaps_removed'   => $rm_slugs,
+            'ccaps_added'     => $add_slugs,
+            // Slugs asked to be removed that this member never had. Harmless,
+            // but it usually means the wrong user or a mistyped slug, and an
+            // empty diff looks identical to a successful removal.
+            'ccaps_remove_noop' => $rm_noop,
+            // Where the ccap actually lives, per blob. Location varies with
+            // membership state (active: root only; demoted: subsites only), so
+            // this is the difference between a removal that works and one that
+            // half-works.
+            'ccaps_by_blob'   => array_map(function ($b) { return $b['ccaps']; }, $blobs),
             'capability_blobs'=> array_keys($blobs),
-            'status'          => ($role_changes || $eot_changes || $sid_changes || $gw_changes)
+            'status'          => ($role_changes || $eot_changes || $sid_changes || $gw_changes || $ccap_changes)
                                     ? 'would_change' : 'already_set',
             '_apply' => [
                 'role'      => $role_changes ? $new_role : null,
@@ -1681,6 +1903,13 @@ function xen_users_set_access($request) {
                 'gw'        => $gw_changes ? $new_gw : null,
                 'gw_clear'  => $gw_clear,
                 'blobs'     => $blobs,
+                'ccap_rm'   => $rm_slugs,
+                'ccap_add'  => $add_slugs,
+                // The predictions carried forward so the readback can be
+                // checked against WHAT WAS PROMISED, not merely against
+                // "something changed".
+                'ccaps_after_pred' => $ccaps_after_pred,
+                'flat_after_pred'  => $flat_after_pred,
             ],
         ];
     }
@@ -1730,24 +1959,63 @@ function xen_users_set_access($request) {
 
         $uid = $p['user_id'];
 
-        // --- role: swap ONLY the role key, restore ccaps, every blob -------
-        if ($apply['role'] !== null) {
+        // --- capability blobs: role swap and/or ccap add/remove ------------
+        //
+        // One pass, one write per blob. The role swap and the ccap edit used to
+        // be separable because only the role ever moved; doing them in two
+        // passes now would write each blob twice and leave the readback unable
+        // to say which pass produced the result.
+        //
+        // Ccap keys are still skipped by the role-stripping loop — that is what
+        // stops a demotion from destroying roster membership. Removal is
+        // explicit and targeted, below, never a side effect of a role change.
+        $root_blob = $wpdb->base_prefix . 'capabilities';
+        if ($apply['role'] !== null || $apply['ccap_rm'] || $apply['ccap_add']) {
             foreach ($apply['blobs'] as $cap_key => $info) {
                 $caps = $info['caps'];
-                foreach (array_keys($caps) as $k) {
-                    if (strpos((string) $k, 'access_s2member_ccap_') === 0) {
-                        continue; // ccaps are not roles; leave them be
+
+                if ($apply['role'] !== null) {
+                    foreach (array_keys($caps) as $k) {
+                        if (strpos((string) $k, 'access_s2member_ccap_') === 0) {
+                            continue; // ccaps are not roles; leave them be
+                        }
+                        unset($caps[$k]);
                     }
-                    unset($caps[$k]);
+                    $caps[$apply['role']] = true;
                 }
-                $caps[$apply['role']] = true;
-                if ($preserve_ccaps) {
-                    foreach ($info['ccaps'] as $cc) {
-                        $caps[$cc] = true;
+
+                // REMOVE from every blob. An active member carries the ccap on
+                // the root only; a member s2Member demoted at EOT carries it on
+                // the subsites only. Scanning all of them is the only rule that
+                // is correct for both.
+                foreach ($apply['ccap_rm'] as $slug) {
+                    unset($caps['access_s2member_ccap_' . $slug]);
+                }
+
+                // ADD to the root blob only — the shape s2Member itself creates
+                // for an active member (verified on users 11900 and 11901).
+                if ($cap_key === $root_blob) {
+                    foreach ($apply['ccap_add'] as $slug) {
+                        $caps['access_s2member_ccap_' . $slug] = true;
                     }
                 }
+
                 update_user_meta($uid, $cap_key, $caps);
             }
+        }
+
+        // --- the flat `ccaps` usermeta key ---------------------------------
+        //
+        // The store that survives demotion, and the roster's primary source.
+        // Moving the capability blobs without this one does not remove the
+        // member from list_users_by_ccap — it just makes the two sources
+        // disagree, which is a worse state than before because it looks like
+        // data corruption rather than a pending task.
+        //
+        // Computed by the same pure helper the dry run used, so what was
+        // predicted is definitionally what gets written.
+        if ($apply['ccap_rm'] || $apply['ccap_add']) {
+            update_user_meta($uid, 'ccaps', $apply['flat_after_pred']);
         }
 
         // --- auto-EOT ------------------------------------------------------
@@ -1786,6 +2054,8 @@ function xen_users_set_access($request) {
         $line = "MCP set-access {$stamp}: level {$p['old_level']} -> {$p['new_level']}"
               . ($apply['eot_clear'] ? ', auto_eot cleared'
                                      : ($apply['eot'] !== null ? ", auto_eot -> {$apply['eot']}" : ''))
+              . ($apply['ccap_rm'] ? ', ccap REMOVED: ' . implode('+', $apply['ccap_rm']) : '')
+              . ($apply['ccap_add'] ? ', ccap added: ' . implode('+', $apply['ccap_add']) : '')
               . " | {$reason}";
         update_user_meta($uid, $note_key, trim($notes . "\n" . $line));
 
@@ -1797,6 +2067,12 @@ function xen_users_set_access($request) {
             'ts' => $stamp, 'reason' => $reason,
             'old_level' => $p['old_level'], 'new_level' => $p['new_level'],
             'old_auto_eot' => $p['old_auto_eot'], 'new_auto_eot' => $p['new_auto_eot'],
+            // Recorded even when empty: a seat removal must be reconstructable
+            // from the member's own record months later, without the ticket.
+            'ccaps_removed' => $apply['ccap_rm'],
+            'ccaps_added'   => $apply['ccap_add'],
+            'ccaps_before'  => $p['ccaps_before'],
+            'flat_ccaps_before' => $p['flat_ccaps_meta'],
         ];
         update_user_meta($uid, 'xen_mcp_access_audit', $audit);
 
@@ -1815,6 +2091,8 @@ function xen_users_set_access($request) {
             );
         }
         $now_ccaps = array_values(array_unique($now_ccaps));
+        sort($now_ccaps);
+        $now_flat = (string) get_user_meta($uid, 'ccaps', true);
 
         $now_sid = get_user_meta($uid, $sid_key, true);
         $now_gw  = get_user_meta($uid, $gw_key, true);
@@ -1834,21 +2112,38 @@ function xen_users_set_access($request) {
         } elseif ($apply['eot'] !== null) {
             $eot_ok = ((string) $now_eot === (string) $apply['eot']);
         }
-        // Ccaps are always preserved, so any shrink is a regression — this is
-        // the guard that catches a role write accidentally clobbering a blob.
-        $ccap_ok = (count($now_ccaps) >= count($p['ccaps_before']));
+        // Set EQUALITY against the prediction, in both stores — not the old
+        // "did the count shrink" heuristic. This is the check that would have
+        // caught the original bug on its first run: the plan said [] and the
+        // record still said [access_s2member_ccap_secant], and a count-based
+        // guard waved that through because the count had not gone DOWN.
+        //
+        // It is also what makes the dry run trustworthy in the strong sense —
+        // "applied" now means the record matches what the preview promised,
+        // not merely that some write was attempted.
+        $ccap_ok = ($now_ccaps === $apply['ccaps_after_pred'])
+                   && ($now_flat === $apply['flat_after_pred']);
 
         $p['new_level']    = $now_role;
         $p['new_auto_eot'] = ($now_eot === '' || $now_eot === false) ? null : $now_eot;
         $p['ccaps_after']  = $now_ccaps;
-        $p['flat_ccaps_meta_after'] = get_user_meta($uid, 'ccaps', true) ?: null;
+        $p['flat_ccaps_meta_after'] = $now_flat === '' ? null : $now_flat;
         $p['status'] = ($role_ok && $eot_ok && $ccap_ok && $sid_ok && $gw_ok)
                         ? 'applied' : 'write_unconfirmed';
 
         if (!$ccap_ok) {
-            $result['warnings'][] = "user {$uid}: ccaps went from "
-                . count($p['ccaps_before']) . ' to ' . count($now_ccaps)
-                . ' — the roster export may no longer see this member. INVESTIGATE.';
+            $result['warnings'][] = "user {$uid}: ccap readback does NOT match the plan. "
+                . 'predicted caps ' . json_encode($apply['ccaps_after_pred'])
+                . ' got ' . json_encode($now_ccaps)
+                . '; predicted flat `ccaps` ' . json_encode($apply['flat_after_pred'])
+                . ' got ' . json_encode($now_flat)
+                . '. The two roster sources may now disagree. INVESTIGATE before trusting any roster.';
+        }
+        if (!empty($p['ccaps_remove_noop'])) {
+            $result['warnings'][] = "user {$uid}: remove_ccap named "
+                . implode(', ', $p['ccaps_remove_noop'])
+                . ' but this member never held it — no removal happened. '
+                . 'Check the slug and the target user.';
         }
         if ($p['status'] === 'write_unconfirmed') {
             $result['ok'] = false;
@@ -1883,8 +2178,12 @@ add_action('rest_api_init', function () {
                                  'description' => 'Gateway subscription/profile ID, or "clear". s2Member wipes this on demotion; restoring it makes the member findable from a gateway notice again.'],
             'subscr_gateway' => ['required' => false,
                                  'description' => 'paypal | stripe | free | manual, or "clear". Required alongside subscr_id when none is stored.'],
+            'remove_ccap'    => ['required' => false,
+                                 'description' => 'Ccap slug(s) to REMOVE — string, comma list, or array. Clears access_s2member_ccap_<slug> from every capability blob AND drops the slug from the flat `ccaps` usermeta key. Other ccaps are preserved. This is how a member leaves a group roster.'],
+            'add_ccap'       => ['required' => false,
+                                 'description' => 'Ccap slug(s) to GRANT — string, comma list, or array. Written to the root capability blob and the flat `ccaps` key, matching the shape s2Member creates for an active member.'],
             'preserve_ccaps' => ['default' => true, 'type' => 'boolean',
-                                 'description' => 'Always true. Passing false is REFUSED with a 400 rather than silently ignored — the endpoint cannot remove a ccap, and a dry run that predicted one was the bug this replaced.'],
+                                 'description' => 'Always true. Passing false is REFUSED with a 400 rather than silently ignored — a boolean cannot name WHICH ccap to drop. Use remove_ccap.'],
             'dry_run'        => ['default' => true, 'type' => 'boolean'],
             'allow_partial'  => ['default' => false, 'type' => 'boolean'],
             'max_batch'      => ['default' => 100, 'type' => 'integer'],

@@ -1250,6 +1250,45 @@ _PRESERVE_CCAPS_REFUSAL = (
 )
 
 
+def _ccap_arg(v: Any) -> str | None:
+    """Coerce a ccap argument into the comma-delimited string the endpoint parses.
+
+    The tools annotate these params `list[str] | str | None` AND coerce here,
+    which looks redundant and is not. mcp-remote FLATTENS anyOf schemas to {}
+    in transit, so the client never learns that a list is acceptable, sends
+    whatever it guesses — usually a JSON string — and pydantic rejects it with a
+    validation error BEFORE the handler runs. The annotation alone does not
+    reach the client; only accepting every plausible shape here does.
+
+    Accepts ["a","b"], "a,b", "a b", '["a","b"]', or "a". Returns None for None
+    so "not supplied" stays distinguishable from "supplied empty" — for a
+    removal that is the difference between leaving a roster alone and being
+    asked to remove nothing.
+
+    Defined ABOVE the @mcp.tool block on purpose: anything between a decorator
+    and its `async def` binds the decorator to the wrong object, registering the
+    helper as a tool and silently unregistering the real one.
+    """
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        if s[0] in "[{":
+            try:
+                v = json.loads(s)
+            except (ValueError, TypeError):
+                return s
+        else:
+            return s
+    if isinstance(v, (list, tuple, set)):
+        parts = [str(x).strip() for x in v if str(x).strip()]
+        return ",".join(parts) or None
+    s = str(v).strip()
+    return s or None
+
+
 @mcp.tool(
     description=(
         "Set a member's s2Member level/role and/or Auto-EOT date on "
@@ -1268,6 +1307,16 @@ _PRESERVE_CCAPS_REFUSAL = (
         "every blob, so the member still appears in list_users_by_ccap "
         "afterwards. Verify that with a roster pull after any demotion.\n"
         "\n"
+        "REMOVING A SEAT is a separate, explicit act: pass remove_ccap. A "
+        "level change never removes a ccap as a side effect, and a ccap "
+        "removal never changes level or Auto-EOT. Group-to-individual "
+        "conversions need both, and they are two arguments, not one.\n"
+        "\n"
+        "The dry run is trustworthy in the strong sense: predicted "
+        "ccaps_after / flat_ccaps_meta_after come from the same code the write "
+        "uses, and a write is only reported 'applied' if reading the record "
+        "back MATCHES that prediction in both stores.\n"
+        "\n"
         "Args:\n"
         "  user: ID, email, login, or slug. Exactly one identifier.\n"
         "  level: 0-5, a role slug ('s2member_level2'), or 'demoted'. Must be "
@@ -1276,12 +1325,21 @@ _PRESERVE_CCAPS_REFUSAL = (
         "The response reports which interpretation was used.\n"
         "  reason: REQUIRED free text. Written to the s2Member notes field and "
         "an audit key so a demotion traces back to its cancellation.\n"
-        "  preserve_ccaps: always True. Passing False is REFUSED, not honoured "
-        "— this tool cannot remove a ccap. It used to accept False, predict "
-        "'ccaps_after: []' in the dry run, and then leave the ccap fully in "
-        "place, reporting 'applied'. Removing a member from a group roster "
-        "still means editing BOTH the s2Member capability and the `ccaps` "
-        "field in wp-admin.\n"
+        "  remove_ccap: slug(s) to take OFF the member — 'secant', "
+        "'a,b', or ['a','b']. THIS is how a seat comes off a group roster: it "
+        "clears access_s2member_ccap_<slug> from every capability blob AND "
+        "drops the slug from the flat `ccaps` usermeta key. Both stores, "
+        "because list_users_by_ccap reads their union — clearing one leaves "
+        "the sources disagreeing instead of removing the member. Any ccap you "
+        "did not name is preserved.\n"
+        "  add_ccap: slug(s) to GRANT, same shapes. Written to the root "
+        "capability blob and the flat key, matching what s2Member creates for "
+        "an active member.\n"
+        "  preserve_ccaps: always True; passing False is REFUSED. A boolean "
+        "cannot say WHICH ccap to drop, so on a multi-ccap member it could "
+        "only mean 'all of them'. It used to be accepted, predict "
+        "'ccaps_after: []' in the dry run, and then change nothing while "
+        "reporting 'applied'. Use remove_ccap.\n"
         "  dry_run: default True. Reads current values and reports the exact "
         "delta without writing.\n"
         "\n"
@@ -1300,6 +1358,8 @@ async def set_member_access(
     auto_eot: str | None = None,
     subscr_id: str | None = None,
     subscr_gateway: str | None = None,
+    remove_ccap: list[str] | str | None = None,
+    add_ccap: list[str] | str | None = None,
     preserve_ccaps: bool = True,
     dry_run: bool = True,
 ) -> dict | str:
@@ -1307,8 +1367,12 @@ async def set_member_access(
         return "ERROR: `reason` is required — it is the audit trail."
     if not preserve_ccaps:
         return _PRESERVE_CCAPS_REFUSAL
-    if level is None and auto_eot is None and subscr_id is None and subscr_gateway is None:
-        return "ERROR: supply at least one of level, auto_eot, subscr_id or subscr_gateway."
+    remove_ccap = _ccap_arg(remove_ccap)
+    add_ccap = _ccap_arg(add_ccap)
+    if (level is None and auto_eot is None and subscr_id is None
+            and subscr_gateway is None and remove_ccap is None and add_ccap is None):
+        return ("ERROR: supply at least one of level, auto_eot, subscr_id, "
+                "subscr_gateway, remove_ccap or add_ccap.")
     payload: dict[str, Any] = {
         "user": user,
         "reason": reason,
@@ -1323,6 +1387,10 @@ async def set_member_access(
         payload["subscr_id"] = subscr_id
     if subscr_gateway is not None:
         payload["subscr_gateway"] = subscr_gateway
+    if remove_ccap is not None:
+        payload["remove_ccap"] = remove_ccap
+    if add_ccap is not None:
+        payload["add_ccap"] = add_ccap
     return await _set_access_call(payload)
 
 
@@ -1345,9 +1413,9 @@ async def set_member_access(
         "\n"
         "CCAP SAFETY: demotions here preserve ccaps, so members stay visible "
         "to list_users_by_ccap. Confirm with a roster pull afterwards. "
-        "preserve_ccaps=False is REFUSED — this tool cannot remove a ccap, and "
-        "it used to say otherwise in the dry run. Seat removals still need a "
-        "wp-admin edit to both the capability and the `ccaps` field.\n"
+        "preserve_ccaps=False is REFUSED: a boolean cannot name which ccap to "
+        "drop, and it used to predict a removal in the dry run that the write "
+        "never performed.\n"
         "\n"
         "Args:\n"
         "  users: list of identifiers (ID/email/login), or list of objects "
