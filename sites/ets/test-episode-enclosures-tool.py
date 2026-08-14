@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["httpx>=0.27.0"]
+# dependencies = ["httpx>=0.27.0,<1.0"]
 # ///
 """Work item 2 re-acceptance — exercised through the MCP surface, not by curl.
 
