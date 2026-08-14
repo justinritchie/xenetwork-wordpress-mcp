@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["httpx>=0.27.0"]
+# dependencies = ["httpx>=0.27.0,<1.0"]
 # ///
 """Does the enclosure tool catch the failure it exists to catch?
 

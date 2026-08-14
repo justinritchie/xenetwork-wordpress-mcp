@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "fastmcp>=3.2,<4",
-#   "httpx>=0.27.0",
+#   "httpx>=0.27.0,<1.0",
 # ]
 # ///
 """Ticket test plan for the wordpress-jumbo doubled-URL bug.
