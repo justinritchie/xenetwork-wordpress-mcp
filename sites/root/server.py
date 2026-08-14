@@ -1223,6 +1223,33 @@ async def _set_access_call(payload: dict[str, Any]) -> dict | str:
     return data
 
 
+# Refused rather than ignored. `preserve_ccaps=False` was accepted by both this
+# server and the endpoint, made the DRY RUN report `ccaps_after: []`, and then
+# wrote nothing — the ccap survived in the capability blob AND in the flat
+# `ccaps` usermeta key, and the response still said "applied". A preview that
+# predicts a change the write cannot make is worse than an absent feature,
+# because the preview is the thing an operator is told to trust before touching
+# a live membership. Fail loudly at the edge instead of round-tripping to a
+# server that will politely do nothing.
+#
+# Declared at module level, ABOVE the @mcp.tool block: a def or assignment
+# sitting between a decorator and its `async def` binds the decorator to the
+# wrong object and silently unregisters the real tool.
+_PRESERVE_CCAPS_REFUSAL = (
+    "ERROR: preserve_ccaps=False is refused, not honoured. This tool cannot "
+    "remove a ccap — it never could. It previously accepted the argument, "
+    "predicted 'ccaps_after: []' in the dry run, then left the ccap fully in "
+    "place in both the capability blob and the flat `ccaps` usermeta key while "
+    "reporting status 'applied'.\n"
+    "\n"
+    "To take a member off a group roster, edit BOTH stores in wp-admin: the "
+    "s2Member custom capability on the user, and the `ccaps` field. "
+    "list_users_by_ccap reads the UNION of the two, so clearing only one "
+    "leaves the roster disagreeing with itself (it surfaces as "
+    "only_in_ccaps_meta / only_in_capabilities in the verification block)."
+)
+
+
 @mcp.tool(
     description=(
         "Set a member's s2Member level/role and/or Auto-EOT date on "
@@ -1249,7 +1276,12 @@ async def _set_access_call(payload: dict[str, Any]) -> dict | str:
         "The response reports which interpretation was used.\n"
         "  reason: REQUIRED free text. Written to the s2Member notes field and "
         "an audit key so a demotion traces back to its cancellation.\n"
-        "  preserve_ccaps: default True. Leave it True.\n"
+        "  preserve_ccaps: always True. Passing False is REFUSED, not honoured "
+        "— this tool cannot remove a ccap. It used to accept False, predict "
+        "'ccaps_after: []' in the dry run, and then leave the ccap fully in "
+        "place, reporting 'applied'. Removing a member from a group roster "
+        "still means editing BOTH the s2Member capability and the `ccaps` "
+        "field in wp-admin.\n"
         "  dry_run: default True. Reads current values and reports the exact "
         "delta without writing.\n"
         "\n"
@@ -1273,6 +1305,8 @@ async def set_member_access(
 ) -> dict | str:
     if not reason or not reason.strip():
         return "ERROR: `reason` is required — it is the audit trail."
+    if not preserve_ccaps:
+        return _PRESERVE_CCAPS_REFUSAL
     if level is None and auto_eot is None and subscr_id is None and subscr_gateway is None:
         return "ERROR: supply at least one of level, auto_eot, subscr_id or subscr_gateway."
     payload: dict[str, Any] = {
@@ -1310,7 +1344,10 @@ async def set_member_access(
         "failure this is built to prevent.\n"
         "\n"
         "CCAP SAFETY: demotions here preserve ccaps, so members stay visible "
-        "to list_users_by_ccap. Confirm with a roster pull afterwards.\n"
+        "to list_users_by_ccap. Confirm with a roster pull afterwards. "
+        "preserve_ccaps=False is REFUSED — this tool cannot remove a ccap, and "
+        "it used to say otherwise in the dry run. Seat removals still need a "
+        "wp-admin edit to both the capability and the `ccaps` field.\n"
         "\n"
         "Args:\n"
         "  users: list of identifiers (ID/email/login), or list of objects "
@@ -1342,6 +1379,8 @@ async def bulk_set_member_access(
 ) -> dict | str:
     if not reason or not reason.strip():
         return "ERROR: `reason` is required — it is the audit trail."
+    if not preserve_ccaps:
+        return _PRESERVE_CCAPS_REFUSAL
     if isinstance(users, str):
         try:
             users = json.loads(users)

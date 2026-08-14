@@ -7,7 +7,7 @@ Description: Surfaces s2Member's user metadata + custom registration fields
              timestamps, gateway IDs, login counts, and custom fields.
              Read-only; only exposes fields when context=edit (auth required).
 Author: Justin Ritchie
-Version: 1.2.0
+Version: 1.2.1
 */
 
 if (!defined('ABSPATH')) {
@@ -1470,6 +1470,30 @@ function xen_users_set_access($request) {
     $dry_run = ($raw_dry === null) ? true : rest_sanitize_boolean($raw_dry);
     $preserve = $request->get_param('preserve_ccaps');
     $preserve_ccaps = ($preserve === null) ? true : rest_sanitize_boolean($preserve);
+
+    // `preserve_ccaps=false` was accepted, and did nothing. The plan below
+    // predicted ccaps_after = [] while the write left every ccap in place: the
+    // role rewrite `continue`s past access_s2member_ccap_* keys and never
+    // strips them, so the "restore the ccaps" branch it guards was already a
+    // no-op. The parameter had no implementation behind it in either store.
+    //
+    // A missing feature is a nuisance. A DRY RUN THAT PREDICTS A CHANGE THE
+    // WRITE CANNOT MAKE is a safety defect, because the preview exists so an
+    // operator can trust it before touching a live membership. Refusing the
+    // argument is the honest failure: the caller learns immediately, instead
+    // of reading "applied" over an unchanged record.
+    if ($preserve_ccaps === false) {
+        return new WP_Error(
+            'preserve_ccaps_unsupported',
+            'preserve_ccaps=false is not implemented — this endpoint has never been '
+            . 'able to remove a ccap, and honouring the flag halfway would report a '
+            . 'removal that did not happen. Ccaps are always preserved here. To take '
+            . 'a member off a group roster, remove BOTH the s2Member capability and '
+            . 'the `ccaps` field in wp-admin; removing only one leaves the roster '
+            . 'export disagreeing with itself.',
+            ['status' => 400]
+        );
+    }
     $allow_partial = rest_sanitize_boolean($request->get_param('allow_partial'));
     $reason = trim((string) $request->get_param('reason'));
     $max_batch = (int) ($request->get_param('max_batch') ?: 100);
@@ -1638,7 +1662,12 @@ function xen_users_set_access($request) {
             'new_subscr_gateway' => $new_gw === null ? ($old_gw === '' ? null : $old_gw)
                                                      : ($new_gw === '' ? null : $new_gw),
             'ccaps_before'    => $ccaps_before,
-            'ccaps_after'     => $preserve_ccaps ? $ccaps_before : [],
+            // Not `$preserve_ccaps ? $ccaps_before : []`. That ternary was the
+            // lie: its false branch promised an empty ccap set that no code
+            // path could produce. preserve_ccaps=false is now refused above, so
+            // the prediction is unconditional and matches the write by
+            // construction rather than by coincidence.
+            'ccaps_after'     => $ccaps_before,
             'flat_ccaps_meta' => get_user_meta($u->ID, 'ccaps', true) ?: null,
             'capability_blobs'=> array_keys($blobs),
             'status'          => ($role_changes || $eot_changes || $sid_changes || $gw_changes)
@@ -1805,7 +1834,9 @@ function xen_users_set_access($request) {
         } elseif ($apply['eot'] !== null) {
             $eot_ok = ((string) $now_eot === (string) $apply['eot']);
         }
-        $ccap_ok = !$preserve_ccaps || (count($now_ccaps) >= count($p['ccaps_before']));
+        // Ccaps are always preserved, so any shrink is a regression — this is
+        // the guard that catches a role write accidentally clobbering a blob.
+        $ccap_ok = (count($now_ccaps) >= count($p['ccaps_before']));
 
         $p['new_level']    = $now_role;
         $p['new_auto_eot'] = ($now_eot === '' || $now_eot === false) ? null : $now_eot;
@@ -1852,7 +1883,8 @@ add_action('rest_api_init', function () {
                                  'description' => 'Gateway subscription/profile ID, or "clear". s2Member wipes this on demotion; restoring it makes the member findable from a gateway notice again.'],
             'subscr_gateway' => ['required' => false,
                                  'description' => 'paypal | stripe | free | manual, or "clear". Required alongside subscr_id when none is stored.'],
-            'preserve_ccaps' => ['default' => true, 'type' => 'boolean'],
+            'preserve_ccaps' => ['default' => true, 'type' => 'boolean',
+                                 'description' => 'Always true. Passing false is REFUSED with a 400 rather than silently ignored — the endpoint cannot remove a ccap, and a dry run that predicted one was the bug this replaced.'],
             'dry_run'        => ['default' => true, 'type' => 'boolean'],
             'allow_partial'  => ['default' => false, 'type' => 'boolean'],
             'max_batch'      => ['default' => 100, 'type' => 'integer'],
