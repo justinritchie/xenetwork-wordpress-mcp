@@ -1412,16 +1412,22 @@ async def set_member_access(
         "failure this is built to prevent.\n"
         "\n"
         "CCAP SAFETY: demotions here preserve ccaps, so members stay visible "
-        "to list_users_by_ccap. Confirm with a roster pull afterwards. "
-        "preserve_ccaps=False is REFUSED: a boolean cannot name which ccap to "
-        "drop, and it used to predict a removal in the dry run that the write "
-        "never performed.\n"
+        "to list_users_by_ccap. Confirm with a roster pull afterwards. To "
+        "actually take seats off a roster, pass remove_ccap — it clears the "
+        "capability in every blob AND the flat `ccaps` key, which are the two "
+        "sources the roster reads. preserve_ccaps=False is REFUSED: a boolean "
+        "cannot name which ccap to drop, and it used to predict a removal in "
+        "the dry run that the write never performed.\n"
         "\n"
         "Args:\n"
         "  users: list of identifiers (ID/email/login), or list of objects "
-        "{identifier, level?, auto_eot?} for per-user overrides. Accepts a "
-        "JSON string too.\n"
-        "  level / auto_eot: batch defaults, overridden per user.\n"
+        "{identifier, level?, auto_eot?, remove_ccap?, add_ccap?} for per-user "
+        "overrides. Accepts a JSON string too.\n"
+        "  level / auto_eot / remove_ccap / add_ccap: batch defaults, "
+        "overridden per user. remove_ccap as a batch default is the seat-block "
+        "removal — every named member comes off that roster in one verified "
+        "operation. Per-row overrides handle the mixed case where most of a "
+        "group is cancelled but one member is converting to individual.\n"
         "  reason: REQUIRED. Written to each member's audit trail.\n"
         "  dry_run: default True.\n"
         "  allow_partial: default False. Leave it False for cancellations.\n"
@@ -1440,6 +1446,8 @@ async def bulk_set_member_access(
     auto_eot: str | None = None,
     subscr_id: str | None = None,
     subscr_gateway: str | None = None,
+    remove_ccap: list[str] | str | None = None,
+    add_ccap: list[str] | str | None = None,
     preserve_ccaps: bool = True,
     dry_run: bool = True,
     allow_partial: bool = False,
@@ -1449,6 +1457,8 @@ async def bulk_set_member_access(
         return "ERROR: `reason` is required — it is the audit trail."
     if not preserve_ccaps:
         return _PRESERVE_CCAPS_REFUSAL
+    remove_ccap = _ccap_arg(remove_ccap)
+    add_ccap = _ccap_arg(add_ccap)
     if isinstance(users, str):
         try:
             users = json.loads(users)
@@ -1457,6 +1467,16 @@ async def bulk_set_member_access(
     if not isinstance(users, list) or not users:
         return "ERROR: `users` must be a non-empty list."
     norm = [u if isinstance(u, dict) else {"identifier": u} for u in users]
+    # Per-row ccap overrides get the same coercion as the batch-level args —
+    # a caller who can pass a list at the top level will pass one in a row too.
+    for row in norm:
+        for key in ("remove_ccap", "add_ccap"):
+            if key in row:
+                coerced = _ccap_arg(row[key])
+                if coerced is None:
+                    row.pop(key)
+                else:
+                    row[key] = coerced
 
     payload: dict[str, Any] = {
         "users": norm,
@@ -1474,6 +1494,10 @@ async def bulk_set_member_access(
         payload["subscr_id"] = subscr_id
     if subscr_gateway is not None:
         payload["subscr_gateway"] = subscr_gateway
+    if remove_ccap is not None:
+        payload["remove_ccap"] = remove_ccap
+    if add_ccap is not None:
+        payload["add_ccap"] = add_ccap
     return await _set_access_call(payload)
 
 
