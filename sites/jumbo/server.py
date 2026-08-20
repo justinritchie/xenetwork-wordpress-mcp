@@ -1601,6 +1601,16 @@ _CONTENT_MIN_VERSION = (2, 8, 0)
         "flattened into one haystack, for 'does this page mention X' checks). "
         "Asserting on content_raw will silently pass on empty strings.\n"
         "\n"
+        "PROTECTED META IS HIDDEN BY DEFAULT. Underscore-prefixed keys are "
+        "filtered out, and platform configuration lives there — Segment Builder "
+        "rules are in `_segment_rules`. A segment can therefore report "
+        "meta_key_count:1 while demonstrably carrying rules in wp-admin. Pass "
+        "include_protected=True to see them; the payload also reports "
+        "protected_meta_key_count so the omission is never silent. This is the "
+        "only way to READ BACK a rules write, so use it whenever verifying one. "
+        "Requires jumbo-qa-rest.php 2.13.0+ — older sites are refused with "
+        "plugin_too_old_for_flag rather than quietly ignoring the flag.\n"
+        "\n"
         "This is a LOOKUP endpoint, not a site dump — one of slug, id or "
         "search is required.\n"
         "\n"
@@ -1624,6 +1634,7 @@ async def get_content(
     status: str = "publish",
     fields: str | None = None,
     per_page: int = 20,
+    include_protected: bool = False,
 ) -> dict:
     if not slug and not id and not search:
         return {
@@ -1654,6 +1665,28 @@ async def get_content(
         params["search"] = search
     if fields:
         params["fields"] = fields
+    if include_protected and (parsed is None or parsed < (2, 13, 0)):
+        # Fail loudly rather than silently returning filtered meta. Only sites on
+        # 2.13.0+ honour the flag; an older site would ignore it and hand back a
+        # payload that looks complete but is not — the caller then "verifies" a
+        # write against meta that was never shown to them.
+        return {
+            "ok": False, "site": s.name, "error": "plugin_too_old_for_flag",
+            "installed_version": raw, "required_version": "2.13.0",
+            "message": (f"{s.name} runs jumbo-qa-rest.php {raw!r}; "
+                        "include_protected needs 2.13.0+. Re-run without the "
+                        "flag, or deploy 2.13.0 to this site."),
+        }
+    if include_protected:
+        # Underscore-prefixed meta is filtered out by default. That default is
+        # right — it keeps _edit_lock and friends out of every payload — but it
+        # also hides the platform configuration this endpoint exists to inspect:
+        # Segment Builder rules live in _segment_rules. Without this flag a
+        # caller reads meta_key_count:1 on a segment that demonstrably has rules
+        # in wp-admin and concludes the post is empty, which is how the bug in
+        # the 2026-08-19 ticket went unnoticed. 2.13.0 also reports
+        # protected_meta_key_count so the omission is visible either way.
+        params["include_protected"] = "true"
 
     try:
         r = await _jq_request("GET", "/content", params)
