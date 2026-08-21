@@ -1856,6 +1856,111 @@ async def set_inventory_limits(
     return data
 
 
+_CONTENT_WRITE_MIN_VERSION = (2, 13, 1)
+_CONTENT_PAGE_WRITE_MIN_VERSION = (2, 15, 0)
+
+
+@mcp.tool(
+    description=(
+        "EDIT an existing page or gated content post — copy, ACF fields, meta.\n"
+        "\n"
+        "USE THIS for every revision after create_content: client copy changes, "
+        "fixing a headline, swapping a form embed, updating ACF field values. "
+        "Editing is the common operation; creating happens once.\n"
+        "\n"
+        "DRY RUN IS THE DEFAULT. The endpoint itself defaults dry_run to false; "
+        "this tool sends true unless you say otherwise, because these are live "
+        "client sites. A dry run returns the same before/after it would produce "
+        "and writes nothing.\n"
+        "\n"
+        "WHICH ARGUMENT TO USE — this matters and is easy to get wrong:\n"
+        "  post   — whitelisted post columns: post_title, post_name, post_status, "
+        "post_excerpt, post_content, post_date, post_parent, menu_order.\n"
+        "  fields — ACF fields, keyed by the field's STORAGE meta key. Use this "
+        "for anything ACF owns; it maintains the companion _<name> row, which raw "
+        "meta writes do not. On this platform post_content is often empty and the "
+        "page is assembled from ACF fields, so this is usually the one you want.\n"
+        "  meta   — raw post meta, for keys ACF does NOT own. A key with a live "
+        "ACF companion row is refused here on purpose: writing one row of a "
+        "two-row pair desynchronises value from definition and wp-admin then "
+        "renders the field empty over populated data.\n"
+        "\n"
+        "Read the post first with get_content(include_protected=True) so you are "
+        "editing against what is actually stored rather than what you assume.\n"
+        "\n"
+        "'page' became writable in mu-plugin 2.15.0. Older sites refuse it, and "
+        "this tool says so plainly rather than letting the endpoint 400.\n"
+        "\n"
+        "Args:\n"
+        "  site: REQUIRED site name from list_sites.\n"
+        "  id: REQUIRED post ID. Must already exist — use create_content to make one.\n"
+        "  post/fields/meta: see above.\n"
+        "  delete_meta: meta keys to REMOVE.\n"
+        "  force_meta: bypass the ACF-ownership guard. For repairing orphan rows, "
+        "not for editing live field values.\n"
+        "  dry_run: defaults True."
+    ),
+)
+async def set_content(
+    site: str,
+    id: int,
+    post: dict | None = None,
+    fields: dict | None = None,
+    meta: dict | None = None,
+    delete_meta: list[str] | str | None = None,
+    force_meta: bool = False,
+    dry_run: bool = True,
+) -> dict:
+    s, err = await _jq_gate(site, _CONTENT_WRITE_MIN_VERSION, "content writes")
+    if err:
+        return err
+
+    if not any([post, fields, meta, delete_meta]):
+        return {"ok": False, "site": s.name,
+                "error": "Nothing to write — pass at least one of post, fields, "
+                         "meta or delete_meta."}
+
+    body: dict[str, Any] = {"id": id, "dry_run": bool(dry_run),
+                            "force_meta": bool(force_meta)}
+    if post:
+        body["post"] = post
+    if fields:
+        body["fields"] = fields
+    if meta:
+        body["meta"] = meta
+    if delete_meta:
+        body["delete_meta"] = delete_meta
+
+    try:
+        r = await _post_site(s, "/wp-json/jumbo-qa/v1/content", body)
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "site": s.name, "error": _err("set_content", e)}
+
+    if isinstance(data, dict):
+        data["site"] = s.name
+        # The endpoint refuses a non-writable post type with its own message. If
+        # that type is 'page', the cause is almost always an un-updated site
+        # rather than a policy decision — say which, so nobody re-litigates the
+        # allowlist when the real answer is "deploy 2.15.0 here".
+        if data.get("code") == "post_type_not_writable" or \
+           data.get("error") == "post_type_not_writable":
+            raw, parsed, _ = await _jq_version(s)
+            if parsed is not None and parsed < _CONTENT_PAGE_WRITE_MIN_VERSION:
+                data["likely_cause"] = (
+                    f"{s.name} runs jumbo-qa-rest.php {raw!r}. Pages became "
+                    "writable in 2.15.0 — deploy it here.")
+        if data.get("dry_run"):
+            data["next_step"] = ("Nothing was written. Re-run with dry_run=False "
+                                 "to apply.")
+        if data.get("forced_meta_keys"):
+            data["WARNING"] = ("force_meta bypassed the ACF pairing guard for "
+                               f"{list(data['forced_meta_keys'])}. If any was a "
+                               "live field rather than an orphan row, wp-admin may "
+                               "now render it empty over real data — check wp-admin.")
+    return data
+
+
 _CONTENT_CREATE_MIN_VERSION = (2, 14, 0)
 
 
