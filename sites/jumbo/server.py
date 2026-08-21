@@ -2081,6 +2081,23 @@ async def create_content(
         if data.get("dry_run"):
             data["next_step"] = ("Nothing was created. Re-run with dry_run=False "
                                  "to actually create it.")
+        # A page created with post_content renders BLANK on this platform, while
+        # reporting ok:true and integrity.verified_by_reread:true — the write
+        # genuinely succeeded, it just went somewhere the theme never reads.
+        # Surveyed aar-u65: 23 of 25 real pages have EMPTY post_content and put
+        # their body in the ACF field `page_content` (confirmed on /waitlist and
+        # /faq). The only two pages with non-empty post_content were both created
+        # through this tool, and both render blank.
+        if post_type == "page" and (post_content or "").strip():
+            data["ATTENTION"] = (
+                "post_content was set on a `page`. On this platform the theme "
+                "assembles pages from ACF and does NOT render post_content, so "
+                "this page will very likely appear BLANK even though the write "
+                "succeeded and verifies on re-read. The body field is normally "
+                "`page_content`. Follow up with: set_content(site, id=<new id>, "
+                "fields={'page_content': '<your HTML>'}). Confirm with "
+                "get_crawler_view rather than trusting ok:true."
+            )
     return data
 
 
