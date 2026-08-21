@@ -1856,6 +1856,101 @@ async def set_inventory_limits(
     return data
 
 
+_CONTENT_CREATE_MIN_VERSION = (2, 14, 0)
+
+
+@mcp.tool(
+    description=(
+        "CREATE a new page or gated content post. The only automated way to make "
+        "a page on these sites.\n"
+        "\n"
+        "USE THIS for waitlist pages, confirmation pages, gated dashboard pages — "
+        "anything that previously had to be hand-built in wp-admin. It also covers "
+        "the platform types: event, segment, email, clip, announcement.\n"
+        "\n"
+        "WHY THIS EXISTS RATHER THAN core REST: POST /wp-json/wp/v2/pages returns "
+        "403 on these sites. Note that a 403 there is NOT proof of a permission "
+        "problem — Cloudflare fronts these hosts and answers an unrecognised "
+        "User-Agent with 403 'error code: 1010' before WordPress ever sees the "
+        "request. Either way, this mu-plugin route is the sanctioned write path; "
+        "do not go spelunking through curl variants.\n"
+        "\n"
+        "DRY RUN IS THE DEFAULT. Pass dry_run=False to actually create. This "
+        "differs from most tools on purpose — these are live client sites.\n"
+        "\n"
+        "DRAFT IS THE DEFAULT, and publishing needs TWO keys: post_status='publish' "
+        "AND publish=True. A draft is invisible to the public and to crawlers, so "
+        "it cannot disturb an open registration window; confirm that with "
+        "get_crawler_view, which should 404 on a draft.\n"
+        "\n"
+        "The response reports resulting_slug alongside requested_slug. WordPress "
+        "resolves a slug collision by appending -2 without complaining, so these "
+        "two disagreeing means any link you already wrote is wrong.\n"
+        "\n"
+        "To then fill the page in, use POST /content via the existing write path — "
+        "this tool creates, it does not populate ACF fields.\n"
+        "\n"
+        "Args:\n"
+        "  site: REQUIRED site name from list_sites.\n"
+        "  post_type: page | event | segment | email | clip | announcement.\n"
+        "  post_title: REQUIRED.\n"
+        "  post_name: slug. Omit to derive from the title.\n"
+        "  post_content: page body HTML. A Gravity Forms embed is "
+        "[gravityform id=\"N\" title=\"false\"].\n"
+        "  post_status: draft (default) | pending | private | publish.\n"
+        "  publish: must be True as well for post_status='publish'.\n"
+        "  dry_run: defaults True."
+    ),
+)
+async def create_content(
+    site: str,
+    post_type: str,
+    post_title: str,
+    post_name: str | None = None,
+    post_content: str | None = None,
+    post_excerpt: str | None = None,
+    post_parent: int | None = None,
+    menu_order: int | None = None,
+    post_status: str = "draft",
+    publish: bool = False,
+    dry_run: bool = True,
+) -> dict:
+    s, err = await _jq_gate(site, _CONTENT_CREATE_MIN_VERSION, "page creation")
+    if err:
+        return err
+
+    body: dict[str, Any] = {
+        "post_type": post_type,
+        "post_title": post_title,
+        "post_status": post_status,
+        "publish": bool(publish),
+        # Sent explicitly rather than relying on the endpoint default, so the
+        # tool's promise holds even if the endpoint's default ever changes.
+        "dry_run": bool(dry_run),
+    }
+    for key, val in (
+        ("post_name", post_name), ("post_content", post_content),
+        ("post_excerpt", post_excerpt), ("post_parent", post_parent),
+        ("menu_order", menu_order),
+    ):
+        if val is not None:
+            body[key] = val
+
+    try:
+        r = await _post_site(s, "/wp-json/jumbo-qa/v1/content/create", body)
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "site": s.name, "error": _err("create_content", e)}
+    if isinstance(data, dict):
+        data["site"] = s.name
+        # Make the safe-by-default behaviour legible instead of something the
+        # caller has to infer from dry_run:true buried in the payload.
+        if data.get("dry_run"):
+            data["next_step"] = ("Nothing was created. Re-run with dry_run=False "
+                                 "to actually create it.")
+    return data
+
+
 @mcp.tool(
     description=(
         "Read an ACF options page — site-wide configuration that lives in ACF, "
