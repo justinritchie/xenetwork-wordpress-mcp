@@ -856,8 +856,36 @@ def _coerce_list(v):
     return v
 
 
+def _coerce_dict(v):
+    """Accept a real dict or a JSON-encoded dict string.
+
+    Same failure as _coerce_list, one type over. A `dict | None` annotation
+    becomes an anyOf, which the client flattens to an empty {} schema; with no
+    declared type the client sends the object as a JSON *string*, and pydantic
+    rejects it with "Input should be a valid dictionary" before the tool body
+    runs. Found 2026-08-21 on set_content — over stdio it worked, through the
+    connector every call failed, which is the same split that hid the
+    markupVersion bug. Object-typed params need this or they are unreachable
+    from a real client.
+    """
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            parsed = json.loads(s)
+        except Exception as e:
+            raise ValueError(
+                f"expected an object or a JSON-encoded object string, got {v[:60]!r}") from e
+        return parsed
+    return v
+
+
 # Batch identifier params — tolerant of JSON-string input from MCP clients.
 EmailList = Annotated[list[str] | None, BeforeValidator(_coerce_list)]
+# Object-valued params — same tolerance, see _coerce_dict.
+JsonObject = Annotated[dict | None, BeforeValidator(_coerce_dict)]
+StrList = Annotated[list[str] | None, BeforeValidator(_coerce_list)]
 UserIdList = Annotated[list[int] | None, BeforeValidator(_coerce_list)]
 
 # Bounded concurrency + backoff so a 150-user batch never hammers WP Engine.
@@ -1904,10 +1932,10 @@ _CONTENT_PAGE_WRITE_MIN_VERSION = (2, 15, 0)
 async def set_content(
     site: str,
     id: int,
-    post: dict | None = None,
-    fields: dict | None = None,
-    meta: dict | None = None,
-    delete_meta: list[str] | str | None = None,
+    post: JsonObject = None,
+    fields: JsonObject = None,
+    meta: JsonObject = None,
+    delete_meta: StrList = None,
     force_meta: bool = False,
     dry_run: bool = True,
 ) -> dict:
