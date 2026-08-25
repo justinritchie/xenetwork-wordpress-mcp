@@ -56,6 +56,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Annotated, Any
+from urllib.parse import quote
 
 import httpx
 from fastmcp import FastMCP
@@ -887,6 +888,9 @@ EmailList = Annotated[list[str] | None, BeforeValidator(_coerce_list)]
 JsonObject = Annotated[dict | None, BeforeValidator(_coerce_dict)]
 StrList = Annotated[list[str] | None, BeforeValidator(_coerce_list)]
 UserIdList = Annotated[list[int] | None, BeforeValidator(_coerce_list)]
+# Lists of objects, e.g. the ACP composer's `add`. Same anyOf-flattening problem
+# as JsonObject — the client sends the whole list as one JSON string.
+DictList = Annotated[list[dict] | None, BeforeValidator(_coerce_list)]
 
 # Bounded concurrency + backoff so a 150-user batch never hammers WP Engine.
 _WRITE_CONCURRENCY = max(1, int(os.environ.get("WP_WRITE_CONCURRENCY", "4")))
@@ -2415,6 +2419,205 @@ async def purge_cache(
         data = r.json()
     except Exception as e:
         return {"ok": False, "site": s.name, "error": _err("purge_cache", e)}
+    if isinstance(data, dict):
+        data["site"] = s.name
+    return data
+
+
+# The ACP composer landed in 2.18.0 alongside /native and /restore.
+_ACP_COMPOSE_MIN_VERSION = (2, 18, 0)
+_ACP_NATIVE_MIN_VERSION = (2, 17, 0)
+
+
+@mcp.tool(
+    description=(
+        "Read the FULL unsummarised ACP column config for a list screen.\n"
+        "\n"
+        "get_acp_columns returns a six-field summary per column and is the right "
+        "tool for a quick look. This returns what ACP actually stored, which is "
+        "roughly three times as much: export, search, sort, filter, bulk_edit, "
+        "editable_type, field_type, width_unit, before, after and more.\n"
+        "\n"
+        "Reach for this when the summary is not enough — before composing "
+        "columns, when modelling a clone, or when a column behaves in a way the "
+        "summary cannot explain.\n"
+        "\n"
+        "Two things the summary hides that matter:\n"
+        "  - `export` is PER COLUMN ('on'/'off'). A column can be visible in "
+        "wp-admin and absent from the CSV, or the reverse. This is usually the "
+        "setting someone actually wants.\n"
+        "  - array ORDER is the on-screen and export order, and the keys are the "
+        "column names the composer takes.\n"
+        "\n"
+        "Also flags credential-bearing columns (auth key, magic link, token) by "
+        "label and meta key. Flags only — nothing is filtered or changed. "
+        "Matching is deliberately broad: a false positive costs a glance, a "
+        "false negative ships a working login in a spreadsheet.\n"
+        "\n"
+        "Read-only. Requires jumbo-qa-rest.php v2.17.0+."
+    ),
+)
+async def get_acp_columns_native(site: str, list_id: str) -> dict:
+    s, err = await _jq_gate(site, _ACP_NATIVE_MIN_VERSION, "native ACP column read")
+    if err:
+        return err
+    try:
+        r = await _get_site(
+            s, f"/wp-json/jumbo-qa/v1/acp/columns/native?list_id={quote(str(list_id))}"
+        )
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "site": s.name, "error": _err("get_acp_columns_native", e)}
+    if isinstance(data, dict):
+        data["site"] = s.name
+    return data
+
+
+@mcp.tool(
+    description=(
+        "Compose an ACP users/list view: add columns, reorder them, set per-column "
+        "export state, remove columns.\n"
+        "\n"
+        "The list IS the export — ACP exports the configured columns in their "
+        "configured order — so shaping the view and shaping the client's CSV are "
+        "the same action.\n"
+        "\n"
+        "DRY RUN BY DEFAULT. Returns the full plan (added, removed, export "
+        "changes, resulting order) and writes nothing until dry_run=false.\n"
+        "\n"
+        "add: [{label, meta_key, clone_from?}]\n"
+        "  A new column is a DEEP COPY of an existing column-meta column with "
+        "only name/label/field changed. Nothing is authored from scratch, so the "
+        "new column inherits a configuration ACP itself produced and accepts. "
+        "clone_from names the template; it defaults to a column-meta sibling. "
+        "Cloning from a non column-meta column is refused rather than guessed — "
+        "ACF-backed columns use the field key as their type and resolve "
+        "differently.\n"
+        "\n"
+        "order: partial list of column names. Named columns lead in the sequence "
+        "given; everything unnamed keeps its relative order and follows. So "
+        "'these six first' does not require enumerating the operational columns. "
+        "Unknown names are REJECTED, never silently dropped.\n"
+        "\n"
+        "export: {\"<name>\": \"on\"|\"off\"} — usually the setting you want. To "
+        "keep a credential column available to admins while removing it from the "
+        "CSV, set export off rather than removing the column.\n"
+        "\n"
+        "remove: a LOSS, restated in warnings. Removing a credential column warns "
+        "and explains why they are deliberately kept on Jumbo event sites.\n"
+        "\n"
+        "Requires `site` and verifies it against the target's own home_url(), so "
+        "a compose aimed at the wrong site is refused rather than discovered "
+        "later in a client's spreadsheet. Backs the previous config up to an "
+        "option row before writing and returns the key; re-reads and verifies the "
+        "landed order rather than trusting the update. Use restore_acp_columns "
+        "with that key to undo.\n"
+        "\n"
+        "Requires jumbo-qa-rest.php v2.18.0+."
+    ),
+)
+async def compose_acp_columns(
+    site: str,
+    list_id: str,
+    add: DictList = None,
+    order: StrList = None,
+    remove: StrList = None,
+    export: JsonObject = None,
+    dry_run: bool = True,
+) -> dict:
+    s, err = await _jq_gate(site, _ACP_COMPOSE_MIN_VERSION, "ACP column compose")
+    if err:
+        return err
+
+    add = add or []
+    order = order or []
+    remove = remove or []
+    export = export or {}
+
+    if not (add or order or remove or export):
+        return {
+            "ok": False,
+            "site": s.name,
+            "error": "nothing_to_do",
+            "message": (
+                "compose_acp_columns was called with no add, order, remove or "
+                "export. That would return 200 having changed nothing. If loose "
+                "keys were passed they may have been stripped in transit — pass "
+                "them as the declared parameters."
+            ),
+            "dry_run": dry_run,
+        }
+
+    for i, spec in enumerate(add):
+        if not isinstance(spec, dict) or not spec.get("label") or not spec.get("meta_key"):
+            return {
+                "ok": False, "site": s.name, "error": "bad_add",
+                "message": f"add[{i}] needs both label and meta_key; got {spec!r}",
+                "dry_run": dry_run,
+            }
+
+    # The site the endpoint will check itself against. Sent explicitly so the
+    # refusal happens server-side on the real value, not on anything guessed here.
+    body = {
+        "site": s.url,
+        "list_id": list_id,
+        "add": add,
+        "order": order,
+        "remove": remove,
+        "export": export,
+        "dry_run": bool(dry_run),
+    }
+    try:
+        r = await _post_site(s, "/wp-json/jumbo-qa/v1/acp/columns/compose", body)
+        data = r.json()
+    except Exception as e:
+        return {
+            "ok": False, "site": s.name, "dry_run": dry_run,
+            "error": _err("compose_acp_columns", e),
+        }
+    if isinstance(data, dict):
+        data["site"] = s.name
+    return data
+
+
+@mcp.tool(
+    description=(
+        "Restore an ACP column config from a backup written by "
+        "compose_acp_columns or acp_transplant_columns.\n"
+        "\n"
+        "Both of those have always written a backup and told callers to 'RESTORE "
+        "FROM option:<key>' when something went wrong, without shipping anything "
+        "that could do it — the recovery path was a manual database edit. This is "
+        "that missing half.\n"
+        "\n"
+        "Writes the original serialized value back rather than re-serializing a "
+        "parsed copy, and verifies the stored bytes match the backup exactly. A "
+        "restore that is merely equivalent is not a restore.\n"
+        "\n"
+        "backup_key accepts the value as returned, with or without the 'option:' "
+        "prefix. dry_run defaults true and reports whether the current config "
+        "already matches the backup, so a pointless restore is visible before it "
+        "runs.\n"
+        "\n"
+        "Requires jumbo-qa-rest.php v2.18.0+."
+    ),
+)
+async def restore_acp_columns(site: str, backup_key: str, dry_run: bool = True) -> dict:
+    s, err = await _jq_gate(site, _ACP_COMPOSE_MIN_VERSION, "ACP column restore")
+    if err:
+        return err
+    try:
+        r = await _post_site(
+            s,
+            "/wp-json/jumbo-qa/v1/acp/columns/restore",
+            {"site": s.url, "backup_key": backup_key, "dry_run": bool(dry_run)},
+        )
+        data = r.json()
+    except Exception as e:
+        return {
+            "ok": False, "site": s.name, "dry_run": dry_run,
+            "error": _err("restore_acp_columns", e),
+        }
     if isinstance(data, dict):
         data["site"] = s.name
     return data
