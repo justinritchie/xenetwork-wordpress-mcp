@@ -7,7 +7,7 @@
 # ]
 # ///
 """
-WordPress (Jumbo client sites) MCP — multi-site, read-only.
+WordPress (Jumbo client sites) MCP — multi-site, read-mostly.
 
 Why this exists: Justin's Jumbo platform hosts many client WordPress
 installs (opusadvisors.events, lcatt.opusadvisors.events, jumbo.live,
@@ -24,8 +24,19 @@ WordPress REST endpoints (/wp/v2/users) so the same surface works
 against any vanilla WP install. Custom-CPT tools can be added later
 per the "add other stuff later" principle.
 
-Read-only by design. No POST/PUT/DELETE tools. Cross-site write
-risk is zero by construction.
+NOT read-only. This header claimed "no POST/PUT/DELETE tools" and "cross-site
+write risk is zero by construction" long after write tools were added — a
+security-posture claim that had quietly become false, which is worse than
+saying nothing.
+
+Write tools, keep current: update_user_meta, bulk_update_user_meta,
+set_content, create_content, set_inventory_limits, acp_transplant_columns,
+reset_acp_user_column_order, compose_acp_columns, restore_acp_columns,
+set_acf_options, purge_cache.
+
+Cross-site write risk is managed, not zero: every write tool takes an explicit
+`site` and resolves it through _resolve_site(), which refuses unknown names and
+never falls back to the active site.
 
 Reads env vars (sourced from ~/.mcp-credentials/wordpress-jumbo.env
 via start.sh):
@@ -2568,7 +2579,21 @@ async def compose_acp_columns(
         "dry_run": bool(dry_run),
     }
     try:
-        r = await _post_site(s, "/wp-json/jumbo-qa/v1/acp/columns/compose", body)
+        # NO AUTOMATIC RETRY on a live add. _post_site retries 429/5xx, which is
+        # right for idempotent calls and wrong here: compose can return 500 AFTER
+        # the row is already written (e.g. its post-write re-read fails), and each
+        # `add` mints a fresh uniqid, so a retry appends a SECOND identical column.
+        # Worse, the retry's backup then captures the intermediate state, so
+        # restoring it does not undo the duplicate.
+        #
+        # Dry runs and no-add calls are safely repeatable, so they keep the retry.
+        if add and not dry_run:
+            r = await client.post(
+                _site_join(s, "/wp-json/jumbo-qa/v1/acp/columns/compose"),
+                json=body, headers=_site_auth(s),
+            )
+        else:
+            r = await _post_site(s, "/wp-json/jumbo-qa/v1/acp/columns/compose", body)
         data = r.json()
     except Exception as e:
         return {
@@ -2595,9 +2620,10 @@ async def compose_acp_columns(
         "restore that is merely equivalent is not a restore.\n"
         "\n"
         "backup_key accepts the value as returned, with or without the 'option:' "
-        "prefix. dry_run defaults true and reports whether the current config "
-        "already matches the backup, so a pointless restore is visible before it "
-        "runs.\n"
+        "prefix. dry_run defaults true and compares the STORED BYTES against the "
+        "backup, so \"already matches\" is trustworthy even when only a value "
+        "changed. An earlier version compared key sets only, which reported an "
+        "export-only restore as a no-op when it was not.\n"
         "\n"
         "Requires jumbo-qa-rest.php v2.18.0+."
     ),
