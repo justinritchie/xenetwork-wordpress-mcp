@@ -2649,6 +2649,154 @@ async def restore_acp_columns(site: str, backup_key: str, dry_run: bool = True) 
     return data
 
 
+_PLAYLIST_CLIPS_MIN_VERSION = (2, 22, 0)
+
+
+@mcp.tool(
+    description=(
+        "Read a playlist's clips, in playlist order.\n"
+        "\n"
+        "Returns the clip IDs plus their titles, and the ACF field keys the "
+        "endpoint resolved. Titles matter: a bare list of integers is not "
+        "something a human can check.\n"
+        "\n"
+        "Requires jumbo-qa-rest.php v2.22.0+."
+    ),
+)
+async def get_playlist_clips(site: str, playlist_id: int) -> dict:
+    s, err = await _jq_gate(site, _PLAYLIST_CLIPS_MIN_VERSION, "playlist clip read")
+    if err:
+        return err
+    try:
+        r = await _get_site(
+            s, f"/wp-json/jumbo-qa/v1/playlist/clips?playlist_id={int(playlist_id)}"
+        )
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "site": s.name, "error": _err("get_playlist_clips", e)}
+    if isinstance(data, dict):
+        data["site"] = s.name
+    return data
+
+
+@mcp.tool(
+    description=(
+        "Add or remove clips on a playlist's ACF repeater.\n"
+        "\n"
+        "DRY RUN BY DEFAULT. Returns the full plan — before, after, added, "
+        "removed, skipped, with titles — and writes nothing until "
+        "dry_run=false.\n"
+        "\n"
+        "DO NOT USE THE CLIP-SIDE FIELDS. A clip carries `add_to_playlist` and "
+        "`associated_playlist`, and they look like the way to do this. They are "
+        "not. The theme hooks acf/save_post: when both are set it appends a row "
+        "to the playlist's repeater and then IMMEDIATELY RESETS BOTH to false "
+        "and null, so they are empty at rest by design. Writing them over REST "
+        "does nothing at all, because acf/save_post fires on an ACF form submit "
+        "and not on a meta write. Anything trying to read playlist membership "
+        "from the clip side finds nothing. The playlist repeater is the only "
+        "durable record, and this tool is how you reach it.\n"
+        "\n"
+        "SELECTORS INTERSECT (AND), and at least one is required:\n"
+        "  clip_ids             explicit list\n"
+        "  date_from / date_to  post_date range, Y-m-d\n"
+        "  id_from / id_to      inclusive post-ID range\n"
+        "  search               substring of the clip title\n"
+        "So date_from=2021-01-01 plus search=PrEP means PrEP clips from 2021 on, "
+        "not either condition. A call with NO selector is refused rather than "
+        "treated as 'every clip' — an accidental all-clips append is the mistake "
+        "this endpoint exists to prevent.\n"
+        "\n"
+        "ORDER: an explicit clip_ids order is preserved verbatim and never "
+        "re-sorted, because an explicit order is a decision. Selector-based "
+        "results come back post_date DESC.\n"
+        "\n"
+        "One bad or non-clip ID refuses the ENTIRE call — no partial writes to a "
+        "playlist. dedupe (default true) skips clips already present and reports "
+        "them as skipped; with dedupe=false duplicates are permitted but flagged "
+        "in `duplicates` and a warning.\n"
+        "\n"
+        "The repeater is min:1, so emptying it is allowed but returns a warning — "
+        "wp-admin will flag the field on the next edit and that reads as "
+        "corruption if nobody said so first.\n"
+        "\n"
+        "Writes are verified by re-read; update_field returning truthy only means "
+        "a write was attempted. Requires jumbo-qa-rest.php v2.22.0+."
+    ),
+)
+async def manage_playlist_clips(
+    site: str,
+    playlist_id: int,
+    action: str = "add",
+    clip_ids: UserIdList = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    id_from: int | None = None,
+    id_to: int | None = None,
+    search: str | None = None,
+    position: str = "append",
+    dedupe: bool = True,
+    dry_run: bool = True,
+) -> dict:
+    s, err = await _jq_gate(site, _PLAYLIST_CLIPS_MIN_VERSION, "playlist clip write")
+    if err:
+        return err
+
+    if action not in ("add", "remove"):
+        return {"ok": False, "site": s.name, "error": "bad_action",
+                "message": f"action must be 'add' or 'remove', got {action!r}."}
+
+    body: dict = {
+        "playlist_id": int(playlist_id),
+        "action": action,
+        "position": position,
+        "dedupe": bool(dedupe),
+        "dry_run": bool(dry_run),
+    }
+    if clip_ids:
+        body["clip_ids"] = [int(c) for c in clip_ids]
+    for k, v in (("date_from", date_from), ("date_to", date_to),
+                 ("search", search)):
+        if v:
+            body[k] = v
+    for k, v in (("id_from", id_from), ("id_to", id_to)):
+        if v:
+            body[k] = int(v)
+
+    # Refuse here as well as server-side. The endpoint would reject it anyway,
+    # but failing before the request makes the reason obvious rather than
+    # arriving as an HTTP error a caller has to unpack.
+    if not any(k in body for k in
+               ("clip_ids", "date_from", "date_to", "id_from", "id_to", "search")):
+        return {
+            "ok": False, "site": s.name, "error": "no_selector",
+            "message": (
+                "At least one selector is required: clip_ids, date_from/date_to, "
+                "id_from/id_to, or search. This will not default to 'every clip'."
+            ),
+            "dry_run": dry_run,
+        }
+
+    try:
+        # A live add is not idempotent — the endpoint rebuilds the whole row set,
+        # so a retry after a post-write failure could append a second time. Skip
+        # the retrying helper for real writes, same reasoning as the ACP composer.
+        if not dry_run:
+            r = await client.post(
+                _site_join(s, "/wp-json/jumbo-qa/v1/playlist/clips"),
+                json=body, headers=_site_auth(s),
+            )
+        else:
+            r = await _post_site(s, "/wp-json/jumbo-qa/v1/playlist/clips", body)
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "site": s.name, "dry_run": dry_run,
+                "error": _err("manage_playlist_clips", e)}
+    if isinstance(data, dict):
+        data["site"] = s.name
+    return data
+
+
 if __name__ == "__main__":
     print(
         f"[wp-jumbo-mcp] starting {SERVER_NAME} on http://localhost:{PORT}/mcp",
